@@ -1,0 +1,339 @@
+{
+  "model": {
+    "name": "Keural Mid-Level Vision Encoder",
+    "version": "mid-1.0",
+    "total_params_M": 183.5,
+    "precision": "bfloat16",
+    "input": {
+      "type": "RGB image",
+      "shape": "B x 3 x H x W",
+      "supported_resolutions": [[384,384],[448,448]],
+      "normalization": {
+        "mean": [0.485, 0.456, 0.406],
+        "std":  [0.229, 0.224, 0.225]
+      }
+    },
+    "output": {
+      "tokens":           "B x N x 768",
+      "pooled":           "B x 768",
+      "attention_mask":   "B x N  (bool)",
+      "level_ids":        "B x N  (int: 0=global, 1=region, 2=detail)",
+      "spatial_metadata": "B x N x 4  (cx, cy, scale_w, scale_h)",
+      "saliency_scores":  "B x N  (float)"
+    }
+  },
+
+  "pipeline": [
+
+    {
+      "stage": 1,
+      "name": "CNN Stem",
+      "purpose": "Hierarchical local feature extraction with 16x spatial downsampling",
+      "input_shape":  "B x 3 x H x W",
+      "output_shape": "B x 768 x (H/16) x (W/16)",
+      "num_stages": 4,
+      "stages": [
+        { "stage": 1, "in_ch": 3,   "out_ch": 128, "kernel": 3, "stride": 2, "norm": "GroupNorm(8)",  "act": "GELU" },
+        { "stage": 2, "in_ch": 128, "out_ch": 256, "kernel": 3, "stride": 2, "norm": "GroupNorm(16)", "act": "GELU" },
+        { "stage": 3, "in_ch": 256, "out_ch": 512, "kernel": 3, "stride": 2, "norm": "GroupNorm(32)", "act": "GELU" },
+        { "stage": 4, "in_ch": 512, "out_ch": 768, "kernel": 3, "stride": 2, "norm": "GroupNorm(48)", "act": "GELU" }
+      ],
+      "total_stride": 16
+    },
+
+    {
+      "stage": 2,
+      "name": "Saliency Predictor",
+      "purpose": "Per-pixel importance score map — drives adaptive token placement",
+      "formula": "S(i,j) = sigmoid( W2 * GELU( W1 * x(i,j) ) )",
+      "input_shape":  "B x 768 x H' x W'",
+      "output_shape": "B x 1   x H' x W'  (values in [0,1])",
+      "layers": [
+        { "type": "Conv2d", "in_ch": 768, "out_ch": 192, "kernel": 3, "padding": 1, "act": "GELU" },
+        { "type": "Conv2d", "in_ch": 192, "out_ch": 1,   "kernel": 1, "act": "Sigmoid" }
+      ],
+      "regularization": {
+        "anti_collapse":     "1 / (var(S) + eps)  — penalizes uniform saliency",
+        "smoothness":        "L2 total variation  — prevents spike noise",
+        "saliency_beta":     0.005,
+        "lambda_smooth":     4.0
+      }
+    },
+
+    {
+      "stage": 3,
+      "name": "ATB Tokenizer (Adaptive Token Budget)",
+      "purpose": "Select spatially diverse tokens at variable count determined by content saliency",
+      "input":  "feature map B x 768 x H' x W', saliency map B x 1 x H' x W'",
+      "output": "selected token positions + ROI-aligned feature vectors",
+      "default_token_budget": 512,
+      "max_token_budget":     2048,
+      "budget_split": {
+        "global": 0.05,
+        "region": 0.25,
+        "detail": 0.70
+      },
+      "budget_floors": {
+        "global": 8,
+        "region": 16,
+        "detail": 0
+      },
+      "selection_mechanism": {
+        "method":                    "Gumbel-softmax differentiable top-K",
+        "temperature_start":         1.0,
+        "temperature_end":           0.05,
+        "temperature_anneal_steps":  50000,
+        "warmup_steps_fixed_grid":   10000,
+        "note": "Fixed uniform grid for first 10K steps; ATB activates gradually via temperature annealing"
+      },
+      "nms": {
+        "region_radius": 3,
+        "detail_radius": 1,
+        "purpose": "Spatial diversity — prevents token clustering"
+      },
+      "saliency_smoothing": {
+        "region_kernel": 7,
+        "detail_kernel": 3
+      },
+      "roi_align": {
+        "output_size": [4, 4],
+        "pooling": "bilinear",
+        "note": "4x4=16 cells per token position, projected to embed_dim"
+      }
+    },
+
+    {
+      "stage": 4,
+      "name": "HCT (Hierarchical Concept Tokenization)",
+      "purpose": "Assign semantic level tag to each token and project to transformer dimension",
+      "levels": {
+        "0_global": {
+          "description":       "Scene-level context",
+          "budget_fraction":   0.05,
+          "saliency_mode":     "average pooling"
+        },
+        "1_region": {
+          "description":       "Object/region level",
+          "budget_fraction":   0.25,
+          "saliency_mode":     "smoothed (kernel=7) + NMS radius=3"
+        },
+        "2_detail": {
+          "description":       "Fine-grained detail",
+          "budget_fraction":   0.70,
+          "saliency_mode":     "raw peaks + NMS radius=1"
+        }
+      },
+      "per_level_components": {
+        "learnable_level_embedding": "shape [3, 768] — added to tokens by level id",
+        "token_constructor_mlp":     "3 separate MLPs (one per level): Linear(16*768, 768) -> GELU -> Linear(768, 768)"
+      },
+      "output": "B x N x 768  with level_ids B x N attached"
+    },
+
+    {
+      "stage": 5,
+      "name": "Spatial Transformer",
+      "purpose": "Contextual reasoning over variable-length token sequence with spatial awareness",
+      "architecture": {
+        "type":        "Pre-norm Transformer",
+        "embed_dim":   768,
+        "depth":       24,
+        "num_heads":   12,
+        "head_dim":    64,
+        "mlp_ratio":   4,
+        "ffn_hidden":  3072,
+        "ffn_type":    "SwiGLU",
+        "norm_type":   "RMSNorm",
+        "norm_eps":    1e-6,
+        "pool_token":  true
+      },
+      "positional_encoding": {
+        "type":            "2D-RoPE (Rotary Position Embedding)",
+        "coordinates":     "continuous (cx, cy) from saliency map — NOT fixed grid",
+        "position_scale":  100,
+        "rope_base":       10000.0,
+        "note": "Each token rotated by its actual spatial origin — handles variable resolution natively"
+      },
+      "scale_bias": {
+        "num_buckets": 8,
+        "basis":       "log2(area)",
+        "shape":       "[8, 768] learnable — added to Q by scale bucket",
+        "purpose":     "Distinguish tokens at same (cx,cy) but different scales"
+      },
+      "attention": {
+        "type":     "multi-head self-attention with variable-length mask",
+        "qkv_proj": "Linear(768, 3*768)",
+        "out_proj":  "Linear(768, 768)"
+      }
+    },
+
+    {
+      "stage": 6,
+      "name": "Output Head",
+      "purpose": "Produce structured KeuralEncoderOutput for downstream VLM or evaluation",
+      "pool_token_projection": "Linear(768, 768)",
+      "output_contract": {
+        "tokens":           "B x N x 768",
+        "pooled":           "B x 768",
+        "attention_mask":   "B x N",
+        "level_ids":        "B x N",
+        "spatial_metadata": "B x N x 4  (cx, cy, scale_w, scale_h)",
+        "saliency_scores":  "B x N"
+      }
+    }
+
+  ],
+
+  "text_encoder": {
+    "model":       "openai/clip-vit-large-patch14",
+    "type":        "CLIP ViT-L/14 text tower",
+    "embed_dim":   768,
+    "max_tokens":  77,
+    "frozen":      true,
+    "role":        "Contrastive supervision during training only — not used at inference"
+  },
+
+  "knowledge_distillation": {
+    "enabled": true,
+    "teachers": [
+      {
+        "name":       "SigLIP-SO400M",
+        "model_id":   "google/siglip-so400m-patch14-384",
+        "embed_dim":  1152,
+        "projection": "Linear(1152, 768) — projects teacher to student space",
+        "frozen":     true,
+        "lambda":     0.5
+      },
+      {
+        "name":       "InternViT-300M",
+        "model_id":   "OpenGVLab/InternViT-300M-448px",
+        "embed_dim":  1024,
+        "projection": "Linear(1024, 768) — projects teacher to student space, bfloat16, auto-resize to 448x448",
+        "frozen":     true,
+        "lambda":     0.5
+      }
+    ],
+    "loss_type": "Cosine distance: mean(1 - cos_sim(student, teacher)) for each teacher"
+  },
+
+  "loss_function": {
+    "formula": "L = L_SigLIP + lambda_hct * L_HCT + lambda_sal * L_saliency + lambda_distill * L_distill",
+    "components": {
+      "L_SigLIP": {
+        "type":                       "sigmoid contrastive (SigLIP formulation)",
+        "targets":                    "all tokens — full image-text alignment",
+        "learnable_temperature_init": 2.30,
+        "learnable_bias_init":        -10.0
+      },
+      "L_HCT": {
+        "type":    "sigmoid contrastive on global-level tokens only",
+        "lambda":  1.0,
+        "alpha":   0.5
+      },
+      "L_saliency": {
+        "type":          "anti-collapse + L2 total variation",
+        "formula":       "1/(var(S)+eps) + lambda_smooth * TV(S)",
+        "lambda_sal":    0.5,
+        "saliency_beta": 0.005,
+        "lambda_smooth": 4.0
+      },
+      "L_distill": {
+        "type":   "Cosine distance from frozen SigLIP + InternViT teachers",
+        "lambda": 0.5
+      }
+    }
+  },
+
+  "training": {
+    "2xH200_141GB": {
+      "batch_size_per_device":  576,
+      "gradient_accumulation":  2,
+      "effective_batch_size":   2304,
+      "gradient_checkpointing": true,
+      "num_workers":            4,
+      "ddp_backend":            "nccl",
+      "distributed":            true,
+      "estimated_time":         "~6.5 days"
+    },
+    "4xH100_80GB": {
+      "batch_size_per_device":  128,
+      "gradient_accumulation":  4,
+      "effective_batch_size":   2048,
+      "gradient_checkpointing": false,
+      "num_workers":            16,
+      "ddp_backend":            "nccl",
+      "distributed":            true,
+      "estimated_time":         "4-5 days"
+    },
+    "shared": {
+      "optimizer":     "AdamW",
+      "betas":         [0.9, 0.95],
+      "weight_decay":  0.05,
+      "lr":            5e-4,
+      "lr_schedule":   "cosine_with_warmup",
+      "warmup_steps":  2000,
+      "max_steps":     18000,
+      "precision":     "bfloat16",
+      "seed":          42,
+      "log_every":     100,
+      "save_every":    1000
+    }
+  },
+
+  "dataset": {
+    "phase":   "Phase 1 — Vision Encoder Pretraining",
+    "sources": [
+      {
+        "name":             "DataComp-1B Medium",
+        "downloaded":       89000000,
+        "used_stage1":      20000000,
+        "storage_GB":       3600,
+        "note":             "Stage 1: 20M curated pairs via --max-samples. Full 89M available for scaling."
+      },
+      {
+        "name":             "COYO-700M Filtered",
+        "downloaded":       32000000,
+        "used_stage1":      0,
+        "storage_GB":       2000,
+        "note":             "Downloaded and indexed. Reserved for Stage 2 (resume from checkpoint)."
+      }
+    ],
+    "total_stage1_pairs":      20000000,
+    "sampler":                 "BucketedSampler — aspect-ratio bucketed, DDP-sharded per rank",
+    "image_buckets":           [[384,384],[448,448]],
+    "max_caption_length_tokens": 77
+  },
+
+  "roadmap": {
+    "poc": {
+      "status":       "COMPLETE",
+      "params_M":     24.7,
+      "embed_dim":    512,
+      "depth":        12,
+      "hardware":     "1x RTX 5090 32GB",
+      "text_encoder": "sentence-transformers/all-MiniLM-L6-v2 (384-dim)",
+      "results": {
+        "VQAv2":     "43.6%",
+        "POPE_F1":   "67.0%",
+        "MME":       "838.8",
+        "TextVQA":   "6.6%",
+        "ScienceQA": "53.7%"
+      }
+    },
+    "mid": {
+      "status":       "SMOKE TEST PASSED — ready for full training",
+      "params_M":     183.5,
+      "embed_dim":    768,
+      "depth":        24,
+      "hardware":     "2x H200 141GB",
+      "text_encoder": "openai/clip-vit-large-patch14 (768-dim)",
+      "target":       "Match SigLIP-SO400M quality at 2x fewer parameters"
+    },
+    "large": {
+      "status":   "Planned 2027",
+      "params_M": 1100,
+      "hardware": "64x H100",
+      "target":   "Foundation model — surpass CLIP ViT-L"
+    }
+  }
+}

@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+dist/
+build/
+
+# Virtual environment
+venv_mid/
+venv/
+.venv/
+
+# Training outputs (large files)
+outputs/
+*.pt
+*.bin
+*.safetensors
+
+# Dataset index cache
+*.cache.pkl
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+nohup.out

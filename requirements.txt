@@ -1,0 +1,56 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Keural Mid-Level Vision Encoder — Python Dependencies
+# Target hardware: 2× H100 80GB (CUDA 12.1+)
+# Python: 3.10
+#
+# Install order matters — see setup_venv.sh for the correct sequence.
+# Do NOT pip install this file directly; use setup_venv.sh instead.
+# PyTorch and flash-attn must be installed with specific index URLs first.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Core: Deep Learning ───────────────────────────────────────────────────────
+# PyTorch installed via setup_venv.sh (needs --index-url for CUDA build)
+# torch==2.3.1+cu121
+# torchvision==0.18.1+cu121
+
+# ── Transformers & HuggingFace ────────────────────────────────────────────────
+transformers==4.44.2          # SiglipVisionModel, AutoModel, PreTrainedModel
+tokenizers==0.19.1            # Fast tokenizer backend (required by transformers)
+huggingface_hub==0.24.6       # snapshot_download, upload_file
+safetensors==0.4.4            # Fast weight save/load (.safetensors format)
+accelerate==0.33.0            # Device map + mixed precision utilities
+datasets==2.21.0              # HuggingFace datasets (COYO streaming)
+
+# ── Image Processing ──────────────────────────────────────────────────────────
+Pillow==10.4.0                # PIL — used in distillation.py
+torchvision==0.18.1           # transforms, functional — installed via setup_venv.sh
+
+# ── Data Pipeline ─────────────────────────────────────────────────────────────
+img2dataset==1.41.0           # Download DataComp / COYO via URL lists
+webdataset==0.2.100           # Read .tar shards (WebDataset format)
+pandas==2.2.2                 # TSV index files, parquet manipulation
+pyarrow==17.0.0               # Parquet read/write backend for pandas
+boto3==1.35.6                 # S3-compatible storage (optional, for remote data)
+
+# ── Numerics & Utilities ──────────────────────────────────────────────────────
+numpy==1.26.4                 # Array ops — must be < 2.0 for torch compat
+scipy==1.14.0                 # Gaussian smoothing (saliency predictor warmup)
+tqdm==4.66.5                  # Progress bars in training loop and download
+
+# ── Config & Serialisation ────────────────────────────────────────────────────
+PyYAML==6.0.2                 # YAML config loading (keural_mid_config.py)
+omegaconf==2.3.0              # Optional: structured config override via CLI
+
+# ── Logging & Monitoring ──────────────────────────────────────────────────────
+wandb==0.17.7                 # Training metrics (optional but recommended)
+tensorboard==2.17.0           # Alternative to wandb
+
+# ── Document Generation (optional — only needed for generate_foundation_doc.py)
+python-docx==1.1.2
+
+# ── Distributed Training ──────────────────────────────────────────────────────
+# torch.distributed (NCCL) is bundled with PyTorch — no extra install needed.
+# flash-attn installed separately in setup_venv.sh (requires compiled build).
+
+# ── Dev / Debug ───────────────────────────────────────────────────────────────
+ipython==8.26.0               # Interactive debugging on server

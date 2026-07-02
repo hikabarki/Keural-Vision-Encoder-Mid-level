@@ -1,8 +1,29 @@
+<div align="center">
+
 # Keural Mid-Level Vision Encoder
 
-**183.5M parameters · ATB Tokenizer · HCT · Spatial Transformer · Knowledge Distillation**
+**183.5M params · Adaptive Token Budget · Hierarchical Concept Tokens · Continuous 2D-RoPE · Dual-Teacher Distillation**
 
-> Built from scratch by MKD Co., Ltd. — not a fine-tuned CLIP variant.
+*Built from scratch by MKD Co., Ltd. — not a fine-tuned CLIP variant.*
+
+<img alt="params" src="https://img.shields.io/badge/params-183.5M-blue">
+<img alt="pytorch" src="https://img.shields.io/badge/PyTorch-2.x-ee4c2c?logo=pytorch&logoColor=white">
+<img alt="precision" src="https://img.shields.io/badge/precision-bfloat16-informational">
+<img alt="status" src="https://img.shields.io/badge/status-training-orange">
+<img alt="license" src="https://img.shields.io/badge/license-proprietary-red">
+
+<br/>
+
+[**🤗 Model**](https://huggingface.co/mkd-hika/keural-vision-encoder-mid) ·
+[**🎬 Interactive Pipeline Diagram**](https://huggingface.co/spaces/mkd-hika/keural-vision-encoder-diagram) ·
+[**📐 Technical Spec**](PIPELINE_TECHNICAL_SPEC.md) ·
+[**🔍 Architecture Audit**](ARCHITECTURE_AUDIT.md)
+
+<br/>
+
+![Animated training pipeline](pipeline_preview.gif)
+
+</div>
 
 ---
 
@@ -18,183 +39,174 @@ Keural Mid is the second stage of the Keural Vision Encoder roadmap, scaling fro
 | Token budget | 256 | **512 (max 2048)** | 1024 (max 4096) |
 | Hardware | 1× RTX 5090 | **2× H200 141GB** | 64× H100 |
 | Text encoder | MiniLM-L6-v2 | **CLIP ViT-L/14** | CLIP ViT-L/14 |
-| Status | ✅ Complete | 🔄 Training | 📅 2027 |
+| Status | ✅ Complete | 🔄 Training | 📅 Planned |
 
 ---
 
 ## Architecture
 
+```mermaid
+flowchart TD
+    IMG["RGB Image · (B, 3, H, W)"] --> STEM["CNN Stem (4-stage strided conv)<br/>3 → 128 → 256 → 512 → 768 · GroupNorm · GELU · stride 16×"]
+    STEM --> SAL["Saliency Predictor<br/>Conv(768→192, k3) → GELU → Conv(192→1, k1) → σ<br/>per-position importance map ∈ (0,1)"]
+    STEM --> ATB["ATB Tokenizer<br/>Gumbel-Top-K + NMS · differentiable weighted pooling<br/>budget 512 (max 2048) · split 5% global / 25% region / 70% detail<br/>fixed-grid warmup → annealed Gumbel sampling"]
+    SAL --> ATB
+    ATB --> HCT["HCT — 3 semantic levels<br/>global(0) · region(1) · detail(2)<br/>learned level embeddings + per-level constructors"]
+    HCT --> TF["Spatial Transformer ×24<br/>RMSNorm · SwiGLU · continuous 2D-RoPE (cx, cy)<br/>8-bucket log-area scale bias · [POOL] token"]
+    TF --> OUT["KeuralEncoderOutput<br/>pooled (B,768) · tokens (B,N,768)<br/>level_ids · spatial_metadata · saliency_scores · attention_mask"]
 ```
-RGB Image (B × 3 × H × W)
-        │
-        ▼
-┌───────────────────────────────┐
-│  CNN Stem  (4-stage, stride 2)│  3→128→256→512→768 ch, GELU, GroupNorm
-│  Total downsampling: 16×      │  Output: B × 768 × (H/16) × (W/16)
-└───────────────────────────────┘
-        │
-        ▼
-┌───────────────────────────────┐
-│  Saliency Predictor           │  Conv(768→192, k=3) → GELU → Conv(192→1, k=1) → Sigmoid
-│  S(i,j) = σ(W₂·GELU(W₁·x))  │  Output: B × 1 × H' × W'
-└───────────────────────────────┘
-        │
-        ▼
-┌───────────────────────────────┐
-│  ATB Tokenizer                │  Gumbel-softmax top-K · NMS · ROI-align 4×4
-│  Budget: 512 default / 2048   │  Split: 5% global / 25% region / 70% detail
-│  max. Differentiable at train │  Warmup: fixed grid for first 10K steps
-└───────────────────────────────┘
-        │
-        ▼
-┌───────────────────────────────┐
-│  HCT  (Hierarchical Concept   │  3 levels: global(0) · region(1) · detail(2)
-│  Tokenization)                │  Per-level: learnable embedding + constructor MLP
-│                               │  Output: B × N × 768 + level_ids B × N
-└───────────────────────────────┘
-        │
-        ▼
-┌───────────────────────────────┐
-│  Spatial Transformer (24L)    │  RMSNorm · SwiGLU FFN · 2D-RoPE (continuous cx,cy)
-│  embed=768, heads=12, d=64    │  Scale bias: 8-bucket log-area embedding on Q
-│  Pre-norm, pool token         │  Variable-length attention_mask from ATB
-└───────────────────────────────┘
-        │
-        ▼
-  KeuralEncoderOutput
-  ├── tokens           B × N × 768
-  ├── pooled           B × 768
-  ├── attention_mask   B × N
-  ├── level_ids        B × N
-  ├── spatial_metadata B × N × 4  (cx, cy, scale_w, scale_h)
-  └── saliency_scores  B × N
-```
+
+> 🎬 **Animated versions:** the GIF above, or the [interactive diagram](https://huggingface.co/spaces/mkd-hika/keural-vision-encoder-diagram) (flowing tensors + compute sweep, pure SVG/JS).
+
+### Output contract
+
+| Field | Shape | Description |
+|---|---|---|
+| `pooled` | `B × 768` | Global image embedding (`[POOL]` token) |
+| `tokens` | `B × N × 768` | Per-token features (`N` = allocated budget) |
+| `level_ids` | `B × N` | `0`=global · `1`=region · `2`=detail |
+| `spatial_metadata` | `B × N × 4` | `(cx, cy, scale_w, scale_h)` ∈ [0, 1] |
+| `saliency_scores` | `B × N` | Per-token importance |
+| `attention_mask` | `B × N` | Valid-token mask |
 
 ---
 
 ## Key Design Decisions
 
 ### Adaptive Token Budget (ATB)
-Unlike CLIP/SigLIP which always produce a fixed N tokens, ATB selects tokens based on saliency at runtime. The budget split (5/25/70) ensures global scene context is always represented while dedicating most capacity to fine-grained detail. Gumbel-softmax makes the selection fully differentiable during training.
+Unlike CLIP/SigLIP which always produce a fixed N tokens, ATB selects tokens based on saliency at runtime. The budget split (5/25/70) ensures global scene context is always represented while dedicating most capacity to fine-grained detail. Gumbel-Top-K with a straight-through estimator keeps selection differentiable; a fixed-grid warmup precedes annealed adaptive sampling.
 
 ### Hierarchical Concept Tokenization (HCT)
-Every token carries an explicit semantic level `{0=global, 1=region, 2=detail}`. Each level has its own learnable embedding and token constructor MLP, giving the transformer structural information about what each token represents — something no existing encoder does.
+Every token carries an explicit semantic level `{0=global, 1=region, 2=detail}`. Each level has its own learnable embedding and token constructor, giving the transformer structural information about what each token represents.
 
 ### 2D-RoPE with Continuous Coordinates
-Position encoding uses the actual `(cx, cy)` spatial coordinates from the saliency map, not a fixed grid. This means tokens at different resolutions or crop positions are always correctly positioned relative to each other.
+Position encoding uses the actual `(cx, cy)` spatial coordinates of each token, not a fixed grid — tokens at different resolutions or crop positions are always correctly positioned relative to each other.
 
 ### Knowledge Distillation
-Two frozen teacher models guide training without requiring proprietary datasets:
-- `google/siglip-so400m-patch14-384` (1152-dim, projected to 768)
-- `OpenGVLab/InternViT-300M-448px` (1024-dim, projected to 768, bfloat16, auto-resized to 448×448)
+Two frozen teachers guide training without requiring their proprietary datasets:
+- `google/siglip-so400m-patch14-384` (1152-dim → projected to 768)
+- `OpenGVLab/InternViT-300M-448px` (1024-dim → projected to 768, bfloat16, auto-resized to 448×448)
 
-This transfers WebLI + LAION knowledge into the student without downloading those datasets.
+### Distributed-Correct Contrastive Training
+Image/text embeddings are **all-gathered across GPUs with gradient preservation** (`training/distributed.py`), so the SigLIP negative pool scales with world size. Loss-side parameters (learnable temperature/bias, text & teacher projections) are broadcast at startup and grad-synced every step, and are **persisted in an `alignment_state.pt` sidecar** next to each checkpoint so evaluation reproduces the exact training embedding space.
 
 ---
 
 ## Repository Structure
 
 ```
-keural-vlm-mid/
+mid/
 ├── architecture/
-│   ├── encoder.py              # KeuralMidEncoder — main model
+│   ├── encoder.py               # KeuralVisionEncoder — main model
 │   └── spatial/
-│       ├── block.py            # TransformerBlock (RMSNorm, SwiGLU, 2D-RoPE)
-│       └── rope_2d.py          # Continuous 2D rotary position encoding
+│       ├── block.py             # SpatialBlock (RMSNorm, SwiGLU, 2D-RoPE, scale bias)
+│       └── rope_2d.py           # Continuous 2D rotary position encoding
 ├── tokenizer/
-│   ├── stem.py                 # CNN Stem (4-stage strided conv)
-│   ├── saliency.py             # Saliency Predictor (2-conv head)
-│   ├── atb_tokenizer.py        # ATB: Gumbel top-K + NMS + ROI-align
-│   ├── token_constructor.py    # HCT per-level MLPs + level embeddings
-│   └── region_sampler.py       # Region/global token sampling utilities
+│   ├── stem.py                  # CNN stem (4-stage strided conv)
+│   ├── saliency.py              # Saliency predictor (2-conv head)
+│   ├── atb_tokenizer.py         # ATB orchestrator: budget split + curriculum
+│   ├── region_sampler.py        # Gumbel-Top-K + NMS + straight-through sampling
+│   └── token_constructor.py     # Global cross-attention + region/detail constructors
 ├── training/
-│   ├── losses.py               # SigLIP + HCT + Saliency + Distillation loss
-│   └── distillation.py         # Teacher model wrappers (SigLIP, InternViT)
+│   ├── losses.py                # SigLIP + HCT + saliency + distillation loss
+│   ├── distillation.py          # Frozen teacher wrappers (SigLIP, InternViT)
+│   └── distributed.py           # Gradient-preserving all_gather · rank sync helpers
 ├── alignment/
-│   ├── hf_wrapper.py           # HuggingFace PreTrainedModel wrapper
-│   └── output_contract.py      # KeuralEncoderOutput dataclass
+│   ├── hf_wrapper.py            # HuggingFace PreTrainedModel wrapper
+│   └── output_contract.py       # KeuralEncoderOutput dataclass
 ├── data/
-│   └── datasets.py             # DataComp+COYO dataset + BucketedSampler (DDP-ready)
-├── configs/
-│   ├── keural_mid_2xh200.yaml        # Primary training config (2× H200)
-│   ├── keural_mid_4xh100.yaml        # Alternative training config (4× H100)
-│   ├── keural_mid_single_gpu.yaml    # Single RTX 5090 config (debug/iteration)
-│   ├── keural_mid_smoke.yaml         # Smoke test config (synthetic data)
-│   └── keural_mid_architecture.json  # Full architecture spec in JSON
+│   └── datasets.py              # WebDataset-tar datasets · BucketedSampler · FrozenTextEncoder
 ├── scripts/
-│   ├── train_mid.py            # Main training script (DDP, NCCL)
-│   └── smoke_test_mid.py       # 5-step sanity check (✅ PASSED, 183.5M params)
-└── keural_mid_config.py        # Typed config dataclass (YAML → Python)
+│   ├── train_mid.py             # DDP training loop (NCCL) + alignment checkpointing
+│   ├── evaluate.py              # ImageNet zero-shot · Flickr30k retrieval · CIFAR-100 probe
+│   ├── viz_saliency.py          # Saliency-map visualization for any checkpoint
+│   └── smoke_test_mid.py        # 5-step sanity check (183.5M params)
+├── configs/
+│   ├── keural_mid_2xh200.yaml   # Primary training config (2× H200)
+│   └── keural_mid_smoke.yaml    # Smoke test config (synthetic data)
+├── keural_mid_config.py         # Typed config dataclasses (YAML → Python)
+├── PIPELINE_TECHNICAL_SPEC.md   # Full reverse-engineered technical specification
+├── ARCHITECTURE_AUDIT.md        # Production audit: findings + severity + repair plan
+└── pipeline_diagram.html        # Self-contained animated pipeline diagram
 ```
 
 ---
 
-## Training
+## Quickstart
 
-### 2× H200 (Primary)
+### Install
 ```bash
-torchrun --nproc_per_node=2 \
-    scripts/train_mid.py \
+pip install -r requirements.txt
+```
+
+### Smoke test (no data, no teachers, ~1 min)
+```bash
+python scripts/smoke_test_mid.py
+# Expected: ALL 5 STEPS PASSED. Parameters: 183.5M
+```
+
+### Train — 2× H200 (primary)
+```bash
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+torchrun --nproc_per_node=2 scripts/train_mid.py \
     --config configs/keural_mid_2xh200.yaml \
     --output-dir outputs/run \
     --max-samples 20000000
 ```
-Effective batch: `576 × 2 accum × 2 GPUs = 2304` · Est. time: ~6.5 days
+Effective batch `768 × 2 accum × 2 GPUs = 3072` · 18K optimizer steps · ~5–6 days.
+Checkpoints include `alignment_state.pt` (text projection, logit scale/bias, teacher projections) — required for faithful evaluation and resume.
 
-### 4× H100 (Alternative)
+### Evaluate a checkpoint
 ```bash
-torchrun --nproc_per_node=4 \
-    scripts/train_mid.py \
-    --config configs/keural_mid_4xh100.yaml \
-    --output-dir outputs/run
+python scripts/evaluate.py \
+    --checkpoint outputs/run/checkpoint-10000 \
+    --benchmarks imagenet flickr30k cifar100
 ```
-Effective batch: `128 × 4 accum × 4 GPUs = 2048` · Est. time: 4–5 days
+Text embeddings are passed through the **trained text projection** loaded from `alignment_state.pt`, so evaluation runs in the same embedding space as training. Legacy checkpoints without the sidecar trigger an explicit warning.
 
-### Single GPU (Debug / Iteration)
+### Visualize saliency maps
 ```bash
-python3.10 scripts/train_mid.py \
-    --config configs/keural_mid_single_gpu.yaml \
-    --output-dir outputs/run
+CUDA_VISIBLE_DEVICES="" python scripts/viz_saliency.py \
+    --checkpoint outputs/run/checkpoint-4000 \
+    --images path/to/images --out outputs/saliency_test --size 384
 ```
-Effective batch: `8 × 32 accum = 256` · Est. time: ~17 days (50K checkpoint recommended)
-
-### Smoke Test
-```bash
-cd /home/mkd-s002/vision-encoder/mid
-python3.10 scripts/smoke_test_mid.py
-# Expected: ALL 5 STEPS PASSED. Parameters: 183.5M
-```
+Renders `original | heatmap | overlay` panels per image (CPU-only — safe to run beside training).
 
 ---
 
 ## Loss Function
 
 ```
-L = L_SigLIP + λ_hct · L_HCT + λ_sal · L_saliency + λ_distill · L_distill
+L_total = L_SigLIP + λ_hct·L_HCT + λ_sal·β_sal·L_saliency + L_distill
 ```
 
-| Component | Formula | Weight |
+| Component | Formula | Effective weight |
 |---|---|---|
-| `L_SigLIP` | Sigmoid contrastive (image ↔ text) | — |
-| `L_HCT` | SigLIP on global-level tokens only | λ=1.0 |
-| `L_saliency` | `1/(var(S)+ε)` + L2 TV | λ=0.5, β=0.005 |
-| `L_distill` | Cosine distance: `mean(1 - cos_sim(student, teacher))` for SigLIP + InternViT | λ=0.5 |
+| `L_SigLIP` | Sigmoid contrastive over all-gathered image↔text pairs | 1.0 |
+| `L_HCT` | Same sigmoid loss on mean-pooled **global-level** tokens | λ_hct = 1.0 |
+| `L_saliency` | Anti-collapse `1/(var(S)+ε)` + total-variation smoothness | λ_sal·β_sal = 0.0025 |
+| `L_distill` | `mean(1 − cos)` to SigLIP + InternViT teachers | 0.25 each |
 
 ---
 
 ## Dataset
 
-**Stage 1** (current): 20M curated pairs from DataComp-1B Medium (`--max-samples 20000000`), 2 full epochs, ~18K steps.
-**Stage 2** (planned): Resume from Stage 1 checkpoint, add COYO-700M Filtered (~32M pairs) for combined ~52M pairs.
+**Stage 1** (current): 20M curated pairs from DataComp-1B Medium, ~18K optimizer steps.
+**Stage 2** (planned): resume from Stage 1, add COYO-700M Filtered (~32M pairs) for ~52M combined.
 
-| Dataset | Downloaded | Used (Stage 1) | Storage | Path |
-|---|---|---|---|---|
-| DataComp-1B Medium | ~89M | **20M curated** | 3.6TB | `/home/work/keural-model/vision-encoder-dataset/datacomp_medium` |
-| COYO-700M Filtered | ~32M | Reserved (Stage 2) | 2.0TB | `/home/work/keural-model/vision-encoder-dataset/coyo_filtered` |
+---
+
+## Documentation
+
+| Doc | Contents |
+|---|---|
+| [`PIPELINE_TECHNICAL_SPEC.md`](PIPELINE_TECHNICAL_SPEC.md) | Complete module-by-module spec: shapes, equations, execution timeline |
+| [`ARCHITECTURE_AUDIT.md`](ARCHITECTURE_AUDIT.md) | Full correctness audit with severity ranking and repair plan |
+| [`pipeline_diagram.html`](pipeline_diagram.html) | Self-contained animated block diagram (open in any browser) |
+| [🤗 Model card](https://huggingface.co/mkd-hika/keural-vision-encoder-mid) | Usage, output contract, teacher table, roadmap |
 
 ---
 
 ## License
 
-Copyright (c) 2026 MKD Co., Ltd. All Rights Reserved.
-Contact: sales@mkd.kr
+Copyright © 2026 MKD Co., Ltd. All Rights Reserved. · Contact: sales@mkd.kr

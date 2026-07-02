@@ -10,7 +10,7 @@ Identical structure to poc/keural_config.py but with mid-level defaults:
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
@@ -55,7 +55,6 @@ class TokenizerConfig:
     gumbel_temperature_end: float = 0.05
     temperature_anneal_steps: int = 50000
     warmup_steps_fixed_grid: int = 10000
-    roi_align_size: int = 4
 
     def __post_init__(self) -> None:
         total = sum(self.budget_split.values())
@@ -83,7 +82,6 @@ class SpatialConfig:
     mlp_ratio: int = 4
     norm_eps: float = 1e-6
     rope_base: float = 10000.0
-    use_pool_token: bool = True
 
     def __post_init__(self) -> None:
         if self.num_heads * self.head_dim != self.embed_dim:
@@ -98,7 +96,6 @@ class SpatialConfig:
 @dataclass
 class LossConfig:
     primary: str = "sigmoid_siglip"
-    hct_alpha: float = 0.5
     saliency_beta: float = 0.005
     saliency_lambda_smooth: float = 4.0
     lambda_hct: float = 1.0
@@ -118,7 +115,7 @@ class DistillationConfig:
 
     Two frozen teacher models guide the encoder toward rich representations:
     - SigLIP-SO400M: strong natural-image teacher (1152-dim → projected to 768)
-    - InternViT-300M: document/text-in-image teacher (768-dim, no projection needed)
+    - InternViT-300M: document/text-in-image teacher (1024-dim → projected to 768)
 
     Teachers are discarded after training — only the student (keural-mid) is deployed.
     """
@@ -126,7 +123,8 @@ class DistillationConfig:
     siglip_model: str = "google/siglip-so400m-patch14-384"
     siglip_embed_dim: int = 1152
     internvit_model: str = "OpenGVLab/InternViT-300M-448px"
-    internvit_embed_dim: int = 768
+    # InternViT-300M-448px hidden_size is 1024 (verified from the model config).
+    internvit_embed_dim: int = 1024
     lambda_siglip: float = 0.5
     lambda_internvit: float = 0.5
 
@@ -208,29 +206,44 @@ class KeuralMidConfig:
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
+    @staticmethod
+    def _filter(section_cls, section_data: dict[str, Any]) -> dict[str, Any]:
+        """Drop keys not present on the dataclass (e.g. removed dead fields like
+        roi_align_size/hct_alpha/use_pool_token in older YAMLs) with a warning,
+        so legacy configs still load instead of raising TypeError."""
+        valid = {f.name for f in fields(section_cls)}
+        dropped = [k for k in section_data if k not in valid]
+        if dropped:
+            import warnings
+            warnings.warn(
+                f"[config] Ignoring unknown {section_cls.__name__} keys "
+                f"(removed/renamed): {dropped}", stacklevel=2,
+            )
+        return {k: v for k, v in section_data.items() if k in valid}
+
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> KeuralMidConfig:
         kwargs: dict[str, Any] = {}
         if "name" in data:
             kwargs["name"] = data["name"]
         if "stem" in data:
-            kwargs["stem"] = StemConfig(**data["stem"])
+            kwargs["stem"] = StemConfig(**cls._filter(StemConfig, data["stem"]))
         if "saliency" in data:
-            kwargs["saliency"] = SaliencyConfig(**data["saliency"])
+            kwargs["saliency"] = SaliencyConfig(**cls._filter(SaliencyConfig, data["saliency"]))
         if "tokenizer" in data:
-            kwargs["tokenizer"] = TokenizerConfig(**data["tokenizer"])
+            kwargs["tokenizer"] = TokenizerConfig(**cls._filter(TokenizerConfig, data["tokenizer"]))
         if "spatial" in data:
-            kwargs["spatial"] = SpatialConfig(**data["spatial"])
+            kwargs["spatial"] = SpatialConfig(**cls._filter(SpatialConfig, data["spatial"]))
         if "loss" in data:
-            kwargs["loss"] = LossConfig(**data["loss"])
+            kwargs["loss"] = LossConfig(**cls._filter(LossConfig, data["loss"]))
         if "distillation" in data:
-            kwargs["distillation"] = DistillationConfig(**data["distillation"])
+            kwargs["distillation"] = DistillationConfig(**cls._filter(DistillationConfig, data["distillation"]))
         if "training" in data:
-            kwargs["training"] = TrainingConfig(**data["training"])
+            kwargs["training"] = TrainingConfig(**cls._filter(TrainingConfig, data["training"]))
         if "data" in data:
             d = dict(data["data"])
             d.setdefault("extra_sources", [])
-            kwargs["data"] = DataConfig(**d)
+            kwargs["data"] = DataConfig(**cls._filter(DataConfig, d))
         return cls(**kwargs)
 
     def save_yaml(self, path: str | Path) -> None:

@@ -39,7 +39,6 @@ tokenizer:
   gumbel_temperature_end: 0.05
   temperature_anneal_steps: 50000
   warmup_steps_fixed_grid: 0
-  roi_align_size: 4
 
 spatial:
   embed_dim: 768
@@ -49,11 +48,9 @@ spatial:
   mlp_ratio: 4
   norm_eps: 1.0e-6
   rope_base: 10000.0
-  use_pool_token: true
 
 loss:
   primary: sigmoid_siglip
-  hct_alpha: 0.5
   saliency_beta: 0.005
   saliency_lambda_smooth: 4.0
   lambda_hct: 1.0
@@ -67,7 +64,7 @@ distillation:
   siglip_model: google/siglip-so400m-patch14-384
   siglip_embed_dim: 1152
   internvit_model: OpenGVLab/InternViT-300M-448px
-  internvit_embed_dim: 768
+  internvit_embed_dim: 1024
   lambda_siglip: 0.5
   lambda_internvit: 0.5
 

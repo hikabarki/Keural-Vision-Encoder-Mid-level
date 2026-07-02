@@ -44,7 +44,7 @@ class SigLIPTeacher(nn.Module):
 
 
 class InternViTTeacher(nn.Module):
-    """Frozen InternViT-300M image encoder. Returns CLS token (B, 768)."""
+    """Frozen InternViT-300M image encoder. Returns CLS token (B, 1024)."""
 
     EXPECTED_SIZE = 448  # InternViT-300M native resolution
 
@@ -69,7 +69,7 @@ class InternViTTeacher(nn.Module):
         # InternViT flash attention requires bfloat16/float16
         pixel_values = pixel_values.to(torch.bfloat16)
         out = self.model(pixel_values=pixel_values)
-        # last_hidden_state[:, 0] is the CLS token: (B, 768)
+        # last_hidden_state[:, 0] is the CLS token: (B, 1024) for InternViT-300M
         return out.last_hidden_state[:, 0].float()
 
 

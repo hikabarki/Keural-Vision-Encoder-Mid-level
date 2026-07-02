@@ -36,6 +36,10 @@ from tqdm import tqdm
 
 from alignment.hf_wrapper import KeuralVisionConfig, KeuralVisionModel
 
+# Must match train_mid.ALIGNMENT_STATE_FILE — the sidecar holding the trained
+# text projection (and logit_scale/bias, teacher projections).
+ALIGNMENT_STATE_FILE = "alignment_state.pt"
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -48,7 +52,63 @@ def load_model(checkpoint_path: str, device: torch.device) -> KeuralVisionModel:
     model = model.to(device).eval()
     n_params = sum(p.numel() for p in model.parameters())
     print(f"[eval] Loaded {n_params:,} params ({n_params/1e6:.1f}M)")
+    # Single GPU eval — DataParallel incompatible with KeuralEncoderOutput dataclass
     return model
+
+
+class _EvalTextEncoder:
+    """Text encoder for evaluation that reproduces the TRAINING text space.
+
+    Training aligned image embeddings against ``proj(CLIP_pooler_output)`` where
+    ``proj`` is a trained Linear(768->768). Evaluation MUST apply the same
+    projection, otherwise image and text embeddings live in different spaces and
+    zero-shot/retrieval collapses to chance. The projection is loaded from the
+    ``alignment_state.pt`` sidecar written next to the checkpoint.
+
+    If the sidecar is missing (legacy checkpoint trained before this fix), we
+    emit a loud warning and fall back to the raw CLIP pooler output — which will
+    NOT match the trained space; numbers from that path are not meaningful.
+    """
+
+    def __init__(self, checkpoint_path: str, device: torch.device,
+                 model_name: str = "openai/clip-vit-large-patch14",
+                 embed_dim: int = 768):
+        from transformers import CLIPTokenizer, CLIPTextModel
+        self.device = device
+        self.tokenizer = CLIPTokenizer.from_pretrained(model_name)
+        self.text_model = CLIPTextModel.from_pretrained(model_name).to(device).eval()
+        raw_dim = self.text_model.config.hidden_size
+
+        self.proj = torch.nn.Linear(raw_dim, embed_dim).to(device).eval()
+        self.has_proj = False
+        sidecar = Path(checkpoint_path) / ALIGNMENT_STATE_FILE
+        if sidecar.exists():
+            state = torch.load(sidecar, map_location="cpu")
+            # text_proj keys are prefixed "proj." (from FrozenTextEncoder).
+            proj_sd = {k[len("proj."):]: v for k, v in state["text_proj"].items()
+                       if k.startswith("proj.")}
+            self.proj.load_state_dict(proj_sd)
+            self.proj.to(device)
+            self.has_proj = True
+            print(f"[eval] Loaded trained text projection from {ALIGNMENT_STATE_FILE} "
+                  "(text embeddings now match the training space).")
+        else:
+            print(f"[eval] WARNING: {ALIGNMENT_STATE_FILE} not found in checkpoint. "
+                  "This is a LEGACY checkpoint trained before alignment params were "
+                  "persisted. Falling back to RAW CLIP text embeddings, which do NOT "
+                  "match the trained image space — zero-shot/retrieval numbers will be "
+                  "meaningless. Retrain (or resume) to produce a valid checkpoint.")
+
+    @torch.no_grad()
+    def __call__(self, captions: list[str]) -> torch.Tensor:
+        """Return L2-normalized text embeddings in the training space, (B, embed_dim)."""
+        inputs = self.tokenizer(
+            captions, padding=True, truncation=True, max_length=77, return_tensors="pt",
+        ).to(self.device)
+        pooled = self.text_model(**inputs).pooler_output.float()
+        if self.has_proj:
+            pooled = self.proj(pooled)
+        return F.normalize(pooled, dim=-1)
 
 
 @torch.no_grad()
@@ -72,39 +132,51 @@ def encode_images(model, dataloader, device) -> torch.Tensor:
 # Benchmark 1: Zero-shot ImageNet Classification
 # ---------------------------------------------------------------------------
 
-def eval_imagenet(model, device, batch_size=128, data_root=None):
-    """Zero-shot ImageNet classification using CLIP-style text prompts."""
+def eval_imagenet(model, device, text_encoder, batch_size=128, data_root=None):
+    """Zero-shot ImageNet classification using CLIP-style text prompts.
+
+    ``text_encoder`` is an _EvalTextEncoder that applies the trained text
+    projection so text embeddings match the training image space.
+    """
     print("\n" + "=" * 60)
     print("  Benchmark: Zero-shot ImageNet Classification")
     print("=" * 60)
 
     try:
-        from torchvision import datasets, transforms
+        from torchvision import transforms
         from transformers import CLIPTokenizer, CLIPTextModel
+        from PIL import Image
+        import pandas as pd
+        import io
     except ImportError:
-        print("[eval] ERROR: torchvision or transformers not installed.")
+        print("[eval] ERROR: required packages not installed.")
         return None
 
-    # Check for ImageNet validation set
+    # Check for ImageNet validation set (parquet format)
     if data_root is None:
-        candidates = [
-            "/home/work/keural-model/vision-encoder-dataset/imagenet/val",
-            "/home/work/data/imagenet/val",
-            "/data/imagenet/val",
-        ]
-        data_root = None
-        for c in candidates:
-            if Path(c).exists():
-                data_root = c
-                break
+        data_root = "/home/work/keural-model/vision-encoder-dataset/imagenet"
 
-    if data_root is None or not Path(data_root).exists():
-        print("[eval] ImageNet validation set not found.")
-        print("       Download it and specify --imagenet-path, or skip this benchmark.")
-        print("       Expected: a folder with 1000 class subdirectories.")
+    parquet_dir = Path(data_root) / "data"
+    parquet_files = sorted(parquet_dir.glob("validation-*.parquet")) if parquet_dir.exists() else []
+
+    if not parquet_files:
+        print(f"[eval] ImageNet validation parquets not found at {parquet_dir}")
         return None
 
-    # Image transforms (match training)
+    # Load all validation data from parquets
+    print(f"[eval] Loading {len(parquet_files)} parquet files...")
+    all_images, all_labels = [], []
+    for pf in tqdm(parquet_files, desc="Loading parquets"):
+        df = pd.read_parquet(pf)
+        for _, row in df.iterrows():
+            img_bytes = row["image"]["bytes"]
+            img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+            all_images.append(img)
+            all_labels.append(row["label"])
+
+    print(f"[eval] ImageNet val: {len(all_images)} images, {max(all_labels)+1} classes")
+
+    # Image transforms
     transform = transforms.Compose([
         transforms.Resize(384, interpolation=transforms.InterpolationMode.BICUBIC),
         transforms.CenterCrop(384),
@@ -112,14 +184,20 @@ def eval_imagenet(model, device, batch_size=128, data_root=None):
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
 
-    dataset = datasets.ImageFolder(data_root, transform=transform)
-    loader = DataLoader(dataset, batch_size=batch_size, num_workers=4, pin_memory=True)
-    print(f"[eval] ImageNet val: {len(dataset)} images, {len(dataset.classes)} classes")
-
-    # Build text embeddings for each class
+    # Build text embeddings for each class using ImageNet class names.
+    # Uses the trained text projection (via text_encoder) so the embeddings live
+    # in the same space as the trained image embeddings.
     print("[eval] Building class text embeddings...")
-    tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-large-patch14")
-    text_model = CLIPTextModel.from_pretrained("openai/clip-vit-large-patch14").to(device).eval()
+
+    # Standard ImageNet class names (load from HF datasets)
+    try:
+        from datasets import load_dataset
+        ds_info = load_dataset("ILSVRC/imagenet-1k", split="validation", streaming=True)
+        class_names = ds_info.features["label"].names
+    except Exception:
+        # Fallback: use label indices
+        num_classes = max(all_labels) + 1
+        class_names = [str(i) for i in range(num_classes)]
 
     templates = [
         "a photo of a {}.",
@@ -130,34 +208,34 @@ def eval_imagenet(model, device, batch_size=128, data_root=None):
     ]
 
     class_embeds = []
-    for cls_name in tqdm(dataset.classes, desc="Text embeddings"):
+    for cls_name in tqdm(class_names, desc="Text embeddings"):
         cls_name_clean = cls_name.replace("_", " ")
         prompts = [t.format(cls_name_clean) for t in templates]
-        inputs = tokenizer(prompts, padding=True, truncation=True, return_tensors="pt").to(device)
-        with torch.no_grad():
-            text_out = text_model(**inputs)
-            embeds = F.normalize(text_out.pooler_output, dim=-1)
-            mean_embed = F.normalize(embeds.mean(dim=0, keepdim=True), dim=-1)
-        class_embeds.append(mean_embed)
+        # text_encoder applies trained proj + L2-normalizes each prompt.
+        embeds = text_encoder(prompts)
+        # Average the 5 templates, then renormalize.
+        mean_embed = F.normalize(embeds.mean(dim=0, keepdim=True), dim=-1)
+        class_embeds.append(mean_embed.cpu())
 
-    class_embeds = torch.cat(class_embeds, dim=0)  # (1000, 768)
+    class_embeds = torch.cat(class_embeds, dim=0).to(device)  # (1000, 768)
     print(f"[eval] Class embeddings: {class_embeds.shape}")
 
     # Encode images and compute accuracy
     correct_1, correct_5, total = 0, 0, 0
-    for images, labels in tqdm(loader, desc="Evaluating"):
-        images = images.to(device)
-        labels = labels.to(device)
+    for i in tqdm(range(0, len(all_images), batch_size), desc="Evaluating"):
+        batch_imgs = all_images[i:i + batch_size]
+        batch_labels = torch.tensor(all_labels[i:i + batch_size], device=device)
+        batch_tensor = torch.stack([transform(img) for img in batch_imgs]).to(device)
 
         with torch.no_grad():
-            out = model(pixel_values=images)
-            img_embeds = F.normalize(out.pooled, dim=-1)  # (B, 768)
-            logits = img_embeds @ class_embeds.T  # (B, 1000)
+            out = model(pixel_values=batch_tensor)
+            img_embeds = F.normalize(out.pooled, dim=-1)
+            logits = img_embeds @ class_embeds.T
 
         _, top5_preds = logits.topk(5, dim=-1)
-        correct_1 += (top5_preds[:, 0] == labels).sum().item()
-        correct_5 += (top5_preds == labels.unsqueeze(1)).any(dim=1).sum().item()
-        total += labels.size(0)
+        correct_1 += (top5_preds[:, 0] == batch_labels).sum().item()
+        correct_5 += (top5_preds == batch_labels.unsqueeze(1)).any(dim=1).sum().item()
+        total += batch_labels.size(0)
 
     top1 = 100.0 * correct_1 / total
     top5 = 100.0 * correct_5 / total
@@ -171,8 +249,11 @@ def eval_imagenet(model, device, batch_size=128, data_root=None):
 # Benchmark 2: Image-Text Retrieval (Flickr30k)
 # ---------------------------------------------------------------------------
 
-def eval_flickr30k(model, device, batch_size=128, data_root=None):
-    """Image-text retrieval on Flickr30k test split."""
+def eval_flickr30k(model, device, text_encoder, batch_size=128, data_root=None):
+    """Image-text retrieval on Flickr30k test split.
+
+    ``text_encoder`` applies the trained text projection (training space).
+    """
     print("\n" + "=" * 60)
     print("  Benchmark: Flickr30k Image-Text Retrieval")
     print("=" * 60)
@@ -187,32 +268,29 @@ def eval_flickr30k(model, device, batch_size=128, data_root=None):
 
     # Try loading Flickr30k
     flickr_path = data_root or "/home/work/keural-model/vision-encoder-dataset/flickr30k"
-    images_dir = Path(flickr_path) / "images"
-    captions_file = Path(flickr_path) / "results.csv"
+    images_dir = Path(flickr_path) / "flickr30k-images"
+    captions_file = Path(flickr_path) / "flickr_annotations_30k.csv"
 
     if not images_dir.exists() or not captions_file.exists():
         print(f"[eval] Flickr30k not found at {flickr_path}")
-        print("       Download Flickr30k and place images/ and results.csv there.")
-        print("       Or skip this benchmark.")
+        print(f"       Expected: {images_dir} and {captions_file}")
         return None
 
-    # Parse captions
-    import csv
+    # Parse captions from CSV (format: raw, sentids, split, filename, img_id)
+    import csv, ast
     image_captions = {}
     with open(captions_file, "r") as f:
-        reader = csv.reader(f, delimiter="|")
-        next(reader)  # header
+        reader = csv.DictReader(f)
         for row in reader:
-            if len(row) >= 3:
-                img_name = row[0].strip()
-                caption = row[2].strip()
-                if img_name not in image_captions:
-                    image_captions[img_name] = []
-                image_captions[img_name].append(caption)
+            if row.get("split") == "test":
+                filename = row["filename"]
+                captions = ast.literal_eval(row["raw"])
+                image_captions[filename] = captions
 
-    # Use first 1000 images for eval
+    # Use test split (or first 1000 if test is larger)
     image_names = sorted(image_captions.keys())[:1000]
     captions_list = [image_captions[name][0] for name in image_names]  # first caption
+    print(f"[eval] Flickr30k: {len(image_names)} test images")
 
     transform = transforms.Compose([
         transforms.Resize(384, interpolation=transforms.InterpolationMode.BICUBIC),
@@ -237,18 +315,12 @@ def eval_flickr30k(model, device, batch_size=128, data_root=None):
         all_img_embeds.append(embeds.cpu())
     img_embeds = torch.cat(all_img_embeds, dim=0)
 
-    # Encode captions
+    # Encode captions through the trained text projection (training space).
     print(f"[eval] Encoding {len(captions_list)} captions...")
-    tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-large-patch14")
-    text_model = CLIPTextModel.from_pretrained("openai/clip-vit-large-patch14").to(device).eval()
-
     all_text_embeds = []
     for i in tqdm(range(0, len(captions_list), batch_size), desc="Captions"):
         batch_caps = captions_list[i:i + batch_size]
-        inputs = tokenizer(batch_caps, padding=True, truncation=True, max_length=77, return_tensors="pt").to(device)
-        with torch.no_grad():
-            text_out = text_model(**inputs)
-            embeds = F.normalize(text_out.pooler_output, dim=-1)
+        embeds = text_encoder(batch_caps)  # trained proj + L2-normalized
         all_text_embeds.append(embeds.cpu())
     text_embeds = torch.cat(all_text_embeds, dim=0)
 
@@ -398,16 +470,21 @@ def main():
     device = torch.device(args.device)
     model = load_model(args.checkpoint, device)
 
+    # Build the text encoder ONCE (loads CLIP + trained projection from sidecar).
+    # CIFAR-100 is a linear probe on image features and needs no text encoder.
+    needs_text = any(b in args.benchmarks for b in ("imagenet", "flickr30k"))
+    text_encoder = _EvalTextEncoder(args.checkpoint, device) if needs_text else None
+
     all_results = {"checkpoint": args.checkpoint}
     t0 = time.time()
 
     if "imagenet" in args.benchmarks:
-        result = eval_imagenet(model, device, args.batch_size, args.imagenet_path)
+        result = eval_imagenet(model, device, text_encoder, args.batch_size, args.imagenet_path)
         if result:
             all_results.update(result)
 
     if "flickr30k" in args.benchmarks:
-        result = eval_flickr30k(model, device, args.batch_size, args.flickr_path)
+        result = eval_flickr30k(model, device, text_encoder, args.batch_size, args.flickr_path)
         if result:
             all_results.update(result)
 

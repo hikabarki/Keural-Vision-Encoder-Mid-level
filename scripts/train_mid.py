@@ -17,6 +17,7 @@ Smoke test (no data, no teachers):
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import math
 import os
@@ -52,6 +53,18 @@ from data.datasets import (
 from keural_mid_config import KeuralMidConfig
 from training.losses import KeuralMidLoss
 from training.distillation import DistillationTeachers
+from training.distributed import all_reduce_grads, broadcast_module_params
+
+# Filename for the sidecar holding all trainable alignment parameters that live
+# OUTSIDE the encoder (the text projection, learnable temperature/bias, and the
+# teacher projections). The encoder itself is saved by save_pretrained; these
+# must be persisted separately or evaluation cannot reproduce the trained
+# image<->text embedding space.
+ALIGNMENT_STATE_FILE = "alignment_state.pt"
+
+
+def _nullcontext():
+    return contextlib.nullcontext()
 
 
 # --------- Helpers ---------
@@ -64,9 +77,51 @@ def cosine_warmup_lr(step, peak_lr, warmup_steps, max_steps, min_lr_ratio=0.05):
     return peak_lr * min_lr_ratio + peak_lr * (1 - min_lr_ratio) * cosine
 
 
-def _rotate_checkpoints(output_dir, best_step=None):
-    # Auto-deletion disabled — user manages checkpoints manually
-    pass
+def _rotate_checkpoints(output_dir, keep_last=None, best_step=None):
+    """Delete old checkpoint-* dirs, keeping the most recent ``keep_last`` and
+    the ``best_step`` checkpoint. No-op when ``keep_last`` is None (the default,
+    preserving the previous behaviour of manual management).
+    """
+    if keep_last is None:
+        return
+    ckpts = sorted(
+        output_dir.glob("checkpoint-*"),
+        key=lambda p: int(p.name.split("-")[-1]) if p.name.split("-")[-1].isdigit() else 0,
+    )
+    protected = set(ckpts[-keep_last:])
+    if best_step is not None:
+        protected.add(output_dir / f"checkpoint-{best_step}")
+    for ck in ckpts:
+        if ck not in protected:
+            shutil.rmtree(ck, ignore_errors=True)
+
+
+def _alignment_state(loss_fn, text_encoder):
+    """Collect the trainable alignment parameters that live outside the encoder.
+
+    Saves the FULL loss_fn state_dict (logit_scale, logit_bias, siglip_proj,
+    internvit_proj) and ONLY the trainable text projection (not the frozen CLIP
+    backbone, which is reloaded from HF by name).
+    """
+    text_proj_sd = {k: v for k, v in text_encoder.state_dict().items() if k.startswith("proj.")}
+    return {"loss_fn": loss_fn.state_dict(), "text_proj": text_proj_sd}
+
+
+def _save_alignment_state(ckpt_dir, loss_fn, text_encoder):
+    torch.save(_alignment_state(loss_fn, text_encoder), ckpt_dir / ALIGNMENT_STATE_FILE)
+
+
+def _load_alignment_state(ckpt_dir, loss_fn, text_encoder):
+    """Restore alignment params from the sidecar if present. Returns True on
+    success, False if the sidecar is missing (legacy checkpoint)."""
+    path = Path(ckpt_dir) / ALIGNMENT_STATE_FILE
+    if not path.exists():
+        return False
+    state = torch.load(path, map_location="cpu")
+    loss_fn.load_state_dict(state["loss_fn"])
+    # strict=False so the frozen backbone keys (absent here) are ignored.
+    text_encoder.load_state_dict(state["text_proj"], strict=False)
+    return True
 
 
 def _save_training_state(ckpt_dir, step, optimizer, scaler):
@@ -76,7 +131,13 @@ def _save_training_state(ckpt_dir, step, optimizer, scaler):
     torch.save(state, ckpt_dir / "training_state.pt")
 
 
-def _resume_from_checkpoint(output_dir, model, optimizer, scaler):
+def _resume_from_checkpoint(output_dir, model, optimizer, scaler, loss_fn, text_encoder):
+    """Restore encoder weights, optimizer/scaler state, AND alignment params
+    (text projection, logit_scale/bias, teacher projections). Loading the
+    alignment sidecar is essential: without it those params reset to random on
+    every resume while the optimizer keeps their stale Adam moments, which
+    silently corrupts training.
+    """
     ckpts = sorted(
         output_dir.glob("checkpoint-*"),
         key=lambda p: int(p.name.split("-")[-1]) if p.name.split("-")[-1].isdigit() else 0,
@@ -93,6 +154,15 @@ def _resume_from_checkpoint(output_dir, model, optimizer, scaler):
     except Exception as e:
         print(f"[train] WARNING: Could not load weights: {e}")
         return 0
+    # Restore alignment params (text proj, temperature/bias, teacher projections).
+    if _load_alignment_state(latest, loss_fn, text_encoder):
+        print("[train] Alignment params (text proj, logit_scale/bias, teacher projs) restored.")
+    else:
+        print(
+            "[train] WARNING: no alignment_state.pt in checkpoint (legacy run). "
+            "Text projection, logit_scale/bias and teacher projections start FRESH. "
+            "Optimizer moments for these params will be discarded to stay consistent."
+        )
     state_path = latest / "training_state.pt"
     if state_path.exists():
         try:
@@ -211,6 +281,12 @@ def train(config, output_dir, synthetic=False, synthetic_size=1000, max_steps_ov
     # Frozen teacher models for KD (skipped if distillation.enabled=false)
     teachers = DistillationTeachers(config.distillation, device)
 
+    # loss_fn and text_encoder are NOT wrapped in DDP (DDP only covers `model`).
+    # Broadcast their initial params from rank 0 so every rank starts identical;
+    # their gradients are all-reduced manually each optimizer step (below).
+    broadcast_module_params(loss_fn)
+    broadcast_module_params(text_encoder)
+
     # Optimizer covers student + loss (temp/bias + SigLIP projection) + text projection
     params = list(model.parameters()) + list(loss_fn.parameters())
     optimizer = torch.optim.AdamW(
@@ -236,11 +312,10 @@ def train(config, output_dir, synthetic=False, synthetic_size=1000, max_steps_ov
         with (output_dir / "training_config.json").open("w") as f:
             json.dump(asdict(config), f, indent=2)
 
-    step = _resume_from_checkpoint(output_dir, raw_model, optimizer, scaler)
+    step = _resume_from_checkpoint(output_dir, raw_model, optimizer, scaler, loss_fn, text_encoder)
 
     best_loss = float("inf")
     best_step = None
-    accum_count = 0
     optimizer.zero_grad(set_to_none=True)
     loader_iter = iter(loader)
     log_lines = []
@@ -252,83 +327,104 @@ def train(config, output_dir, synthetic=False, synthetic_size=1000, max_steps_ov
     text_encoder.train()
     # teachers stay in eval() — DistillationTeachers.__init__ sets them eval
 
-    eff_batch = config.training.batch_size_per_device * config.training.gradient_accumulation * world_size
+    grad_accum = config.training.gradient_accumulation
+    # `step` counts OPTIMIZER updates (not micro-batches). Every schedule below
+    # — LR warmup/cosine, tokenizer curriculum, save/log cadence — is expressed
+    # in optimizer steps. One `step` consumes `grad_accum` micro-batches.
+    eff_batch = config.training.batch_size_per_device * grad_accum * world_size
+    # All trainable params, for gradient clipping (encoder via DDP module, plus
+    # the loss/text params that live outside DDP).
+    clip_params = list(model.parameters()) + list(loss_fn.parameters()) + \
+        [p for p in text_encoder.parameters() if p.requires_grad]
     if is_main:
-        print(f"[train] Starting. max_steps={max_steps}, "
+        print(f"[train] Starting. max_steps={max_steps} (optimizer steps), "
               f"batch_per_gpu={config.training.batch_size_per_device}, "
-              f"accum={config.training.gradient_accumulation}, "
+              f"accum={grad_accum}, "
               f"gpus={world_size}, "
               f"effective_batch={eff_batch}")
 
+    def _next_batch():
+        nonlocal loader_iter
+        try:
+            return next(loader_iter)
+        except StopIteration:
+            loader_iter = iter(loader)
+            return next(loader_iter)
+
     try:
         while step < max_steps:
-            try:
-                batch = next(loader_iter)
-            except StopIteration:
-                loader_iter = iter(loader)
-                batch = next(loader_iter)
+            # ---- Accumulate grad_accum micro-batches into one optimizer step ----
+            for micro in range(grad_accum):
+                batch = _next_batch()
+                pixel_values = batch["pixel_values"].to(device, non_blocking=True)
+                captions = batch["captions"]
 
-            pixel_values = batch["pixel_values"].to(device, non_blocking=True)
-            captions = batch["captions"]
+                text_embeds = text_encoder(captions)
+                # Frozen teacher pooled vectors (no_grad inside teachers.forward)
+                t_siglip, t_internvit = teachers(pixel_values)
 
-            text_embeds = text_encoder(captions)
-
-            # Get frozen teacher pooled vectors (no_grad inside DistillationTeachers.forward)
-            t_siglip, t_internvit = teachers(pixel_values)
-
-            if use_amp:
-                with torch.autocast(device_type=device.type, dtype=amp_dtype):
-                    encoder_out, sal_map = raw_model.encoder(
-                        pixel_values=pixel_values,
-                        token_budget=config.tokenizer.default_token_budget,
-                        step=step, return_saliency_map=True,
-                    )
-                    loss_out = loss_fn(
-                        encoder_out, text_embeds,
-                        saliency_map=sal_map,
-                        teacher_siglip_pooled=t_siglip,
-                        teacher_internvit_pooled=t_internvit,
-                    )
-                    loss = loss_out.total / config.training.gradient_accumulation
-            else:
-                encoder_out, sal_map = raw_model.encoder(
-                    pixel_values=pixel_values, token_budget=None,
-                    step=step, return_saliency_map=True,
+                # Skip DDP gradient all-reduce on non-final micro-batches; only
+                # the last micro-batch of the accumulation window syncs.
+                is_last_micro = (micro == grad_accum - 1)
+                sync_ctx = (
+                    model.no_sync() if (dist.is_initialized() and not is_last_micro)
+                    else _nullcontext()
                 )
-                loss_out = loss_fn(
-                    encoder_out, text_embeds,
-                    saliency_map=sal_map,
-                    teacher_siglip_pooled=t_siglip,
-                    teacher_internvit_pooled=t_internvit,
-                )
-                loss = loss_out.total / config.training.gradient_accumulation
+                with sync_ctx:
+                    if use_amp:
+                        with torch.autocast(device_type=device.type, dtype=amp_dtype):
+                            encoder_out, sal_map = raw_model.encoder(
+                                pixel_values=pixel_values,
+                                token_budget=config.tokenizer.default_token_budget,
+                                step=step, return_saliency_map=True,
+                            )
+                            loss_out = loss_fn(
+                                encoder_out, text_embeds,
+                                saliency_map=sal_map,
+                                teacher_siglip_pooled=t_siglip,
+                                teacher_internvit_pooled=t_internvit,
+                            )
+                            loss = loss_out.total / grad_accum
+                    else:
+                        encoder_out, sal_map = raw_model.encoder(
+                            pixel_values=pixel_values, token_budget=None,
+                            step=step, return_saliency_map=True,
+                        )
+                        loss_out = loss_fn(
+                            encoder_out, text_embeds,
+                            saliency_map=sal_map,
+                            teacher_siglip_pooled=t_siglip,
+                            teacher_internvit_pooled=t_internvit,
+                        )
+                        loss = loss_out.total / grad_accum
 
+                    if scaler is not None:
+                        scaler.scale(loss).backward()
+                    else:
+                        loss.backward()
+
+            # ---- One optimizer update ----
+            # loss_fn and text_encoder are outside DDP: manually average their
+            # grads across ranks so temperature/bias/projections stay identical.
             if scaler is not None:
-                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+            all_reduce_grads(loss_fn)
+            all_reduce_grads(text_encoder)
+            grad_norm = nn.utils.clip_grad_norm_(clip_params, 1.0)
+            if scaler is not None:
+                scaler.step(optimizer)
+                scaler.update()
             else:
-                loss.backward()
+                optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
 
-            accum_count += 1
-            if accum_count >= config.training.gradient_accumulation:
-                if scaler is not None:
-                    scaler.unscale_(optimizer)
-                    grad_norm = nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                    scaler.step(optimizer)
-                    scaler.update()
-                else:
-                    grad_norm = nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                    optimizer.step()
+            current_lr = cosine_warmup_lr(
+                step, config.training.lr, config.training.warmup_steps, max_steps
+            )
+            for pg in optimizer.param_groups:
+                pg["lr"] = current_lr
 
-                optimizer.zero_grad(set_to_none=True)
-                accum_count = 0
-
-                current_lr = cosine_warmup_lr(
-                    step, config.training.lr, config.training.warmup_steps, max_steps
-                )
-                for pg in optimizer.param_groups:
-                    pg["lr"] = current_lr
-
-                if is_main and step % config.training.log_every == 0:
+            if is_main and step % config.training.log_every == 0:
                     elapsed = time.time() - last_log_t
                     last_log_t = time.time()
                     elapsed_total = time.time() - t0
@@ -337,7 +433,8 @@ def train(config, output_dir, synthetic=False, synthetic_size=1000, max_steps_ov
                     eta_h, eta_m = divmod(eta_secs // 60, 60)
                     pct = step / max_steps * 100
 
-                    imgs_per_sec = config.training.batch_size_per_device * config.training.gradient_accumulation / max(elapsed, 1e-6)
+                    # imgs/sec over the full optimizer step (all micro-batches, this GPU).
+                    imgs_per_sec = config.training.batch_size_per_device * grad_accum / max(elapsed, 1e-6)
                     gpu_mem_gb = torch.cuda.max_memory_allocated(device) / 1024**3
                     now_str = time.strftime("%Y-%m-%d %H:%M:%S")
 
@@ -377,25 +474,29 @@ def train(config, output_dir, synthetic=False, synthetic_size=1000, max_steps_ov
                         f"({elapsed:.1f}s)"
                     )
 
-                if is_main and step > 0 and step % config.training.save_every == 0:
-                    ckpt_dir = output_dir / f"checkpoint-{step}"
-                    raw_model.save_pretrained(ckpt_dir)
-                    _save_training_state(ckpt_dir, step, optimizer, scaler)
-                    current_loss = loss_out.total.item()
-                    if current_loss < best_loss:
-                        best_loss = current_loss
-                        best_step = step
-                        print(f"[train] New best at step {step} (loss={best_loss:.4f})")
-                    print(f"[train] Saved checkpoint to {ckpt_dir}")
-                    _rotate_checkpoints(output_dir, best_step=best_step)
-                if dist.is_initialized():
-                    dist.barrier()
+            if is_main and step > 0 and step % config.training.save_every == 0:
+                ckpt_dir = output_dir / f"checkpoint-{step}"
+                raw_model.save_pretrained(ckpt_dir)
+                _save_training_state(ckpt_dir, step, optimizer, scaler)
+                # Persist alignment params (text proj, logit_scale/bias, teacher
+                # projections) so evaluation/resume can reproduce the embedding space.
+                _save_alignment_state(ckpt_dir, loss_fn, text_encoder)
+                current_loss = loss_out.total.item()
+                if current_loss < best_loss:
+                    best_loss = current_loss
+                    best_step = step
+                    print(f"[train] New best at step {step} (loss={best_loss:.4f})")
+                print(f"[train] Saved checkpoint to {ckpt_dir}")
+                _rotate_checkpoints(output_dir, best_step=best_step)
+            if dist.is_initialized():
+                dist.barrier()
 
-                step += 1
+            step += 1
 
         if is_main:
             final_dir = output_dir / "final"
             raw_model.save_pretrained(final_dir)
+            _save_alignment_state(final_dir, loss_fn, text_encoder)
             print(f"[train] Final model saved to {final_dir}")
 
     except KeyboardInterrupt:

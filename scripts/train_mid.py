@@ -448,6 +448,12 @@ def train(config, output_dir, synthetic=False, synthetic_size=1000, max_steps_ov
                         **loss_out.components,
                     }
                     log_lines.append(log)
+                    # Flush each entry immediately (append mode) so the metric
+                    # history survives SIGKILL/OOM — the end-of-run bulk write
+                    # never happens on a hard kill, and append preserves
+                    # entries from previous runs across resumes.
+                    with (output_dir / "training_log.jsonl").open("a") as jf:
+                        jf.write(json.dumps(log) + "\n")
                     sal_val = log.get('loss/saliency', 0.0)
                     cos_sig = log.get('cos_sim_siglip', 0.0)
                     cos_int = log.get('cos_sim_internvit', 0.0)
@@ -507,10 +513,9 @@ def train(config, output_dir, synthetic=False, synthetic_size=1000, max_steps_ov
         traceback.print_exc()
         raise
     finally:
-        if is_main:
-            with (output_dir / "training_log.jsonl").open("w") as f:
-                for entry in log_lines:
-                    f.write(json.dumps(entry) + "\n")
+        # training_log.jsonl is appended incrementally at every log step (so it
+        # survives SIGKILL/OOM); no bulk rewrite here — a "w" rewrite would
+        # discard entries from previous runs after a resume.
         cleanup_ddp()
 
     return {"steps_completed": step, "final_loss": log_lines[-1]["loss/total"] if log_lines else None}

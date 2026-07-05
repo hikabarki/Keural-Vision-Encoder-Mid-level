@@ -156,6 +156,10 @@ class RegionSampler(nn.Module):
         coords = torch.zeros(B, K, 2, device=device, dtype=torch.int64)
 
         r = self.nms_radius
+        # Precomputed index vectors for vectorized rectangular suppression.
+        row_idx = torch.arange(h, device=device)  # (h,)
+        col_idx = torch.arange(w, device=device)  # (w,)
+
         for k in range(K):
             # Flatten and argmax
             flat = working.view(B, h * w)
@@ -168,15 +172,14 @@ class RegionSampler(nn.Module):
             if r == 0 or k == K - 1:
                 continue
 
-            # Suppress an axis-aligned square neighborhood. We do this with
-            # a per-batch loop over picks because the picked coordinates
-            # differ per batch element. For the tiny K we use, this is fine.
-            for b in range(B):
-                y0 = max(0, ys[b].item() - r)
-                y1 = min(h, ys[b].item() + r + 1)
-                x0 = max(0, xs[b].item() - r)
-                x1 = min(w, xs[b].item() + r + 1)
-                working[b, y0:y1, x0:x1] = float("-inf")
+            # Suppress an axis-aligned square neighborhood around each pick.
+            # Fully vectorized across the batch: a grid cell (y, x) is inside
+            # batch b's square iff |y - ys[b]| <= r and |x - xs[b]| <= r
+            # (boundary clamping is implicit — indices never leave the grid).
+            row_mask = (row_idx.unsqueeze(0) - ys.unsqueeze(1)).abs() <= r  # (B, h)
+            col_mask = (col_idx.unsqueeze(0) - xs.unsqueeze(1)).abs() <= r  # (B, w)
+            square = row_mask.unsqueeze(2) & col_mask.unsqueeze(1)          # (B, h, w)
+            working.masked_fill_(square, float("-inf"))
 
         return coords
 

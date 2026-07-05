@@ -32,15 +32,16 @@ class SigLIPTeacher(nn.Module):
         for p in self.model.parameters():
             p.requires_grad = False
         self.model.eval()
+        self.model.to(torch.bfloat16)  # frozen teacher; bf16 halves inference cost (matches InternViT)
 
     @torch.no_grad()
     def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
         # pixel_values: (B, 3, H, W) already preprocessed by keural pipeline.
         # SigLIP expects its own preprocessing — we do a forward pass directly
         # on the vision model to get the CLS pooled output.
-        out = self.model(pixel_values=pixel_values)
-        # out.pooler_output: (B, 1152)
-        return out.pooler_output
+        out = self.model(pixel_values=pixel_values.to(torch.bfloat16))
+        # out.pooler_output: (B, 1152), cast back for the fp32 loss path
+        return out.pooler_output.float()
 
 
 class InternViTTeacher(nn.Module):

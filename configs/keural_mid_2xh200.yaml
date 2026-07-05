@@ -109,5 +109,5 @@ data:
   pixel_mean: [0.485, 0.456, 0.406]
   pixel_std: [0.229, 0.224, 0.225]
   max_caption_length: 77
-  num_workers: 12
+  num_workers: 6                  # was 12: 24 workers x ~9.7GB index copies hit the 352GiB cgroup cap -> OOM kill on 07/03
   text_encoder_name: openai/clip-vit-large-patch14

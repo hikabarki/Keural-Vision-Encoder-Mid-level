@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="keural-logo.svg" alt="Keural logo" width="104" height="104">
+
 # Keural Mid-Level Vision Encoder
 
 **183.5M params · Adaptive Token Budget · Hierarchical Concept Tokens · Continuous 2D-RoPE · Dual-Teacher Distillation**

@@ -96,41 +96,41 @@ Image/text embeddings are **all-gathered across GPUs with gradient preservation*
 
 ## Repository Structure
 
-```
+<pre>
 mid/
-├── architecture/
-│   ├── encoder.py               # KeuralVisionEncoder — main model
-│   └── spatial/
-│       ├── block.py             # SpatialBlock (RMSNorm, SwiGLU, 2D-RoPE, scale bias)
-│       └── rope_2d.py           # Continuous 2D rotary position encoding
-├── tokenizer/
-│   ├── stem.py                  # CNN stem (4-stage strided conv)
-│   ├── saliency.py              # Saliency predictor (2-conv head)
-│   ├── atb_tokenizer.py         # ATB orchestrator: budget split + curriculum
-│   ├── region_sampler.py        # Gumbel-Top-K + NMS + straight-through sampling
-│   └── token_constructor.py     # Global cross-attention + region/detail constructors
-├── training/
-│   ├── losses.py                # SigLIP + HCT + saliency + distillation loss
-│   ├── distillation.py          # Frozen teacher wrappers (SigLIP, InternViT)
-│   └── distributed.py           # Gradient-preserving all_gather · rank sync helpers
-├── alignment/
-│   ├── hf_wrapper.py            # HuggingFace PreTrainedModel wrapper
-│   └── output_contract.py       # KeuralEncoderOutput dataclass
-├── data/
-│   └── datasets.py              # WebDataset-tar datasets · BucketedSampler · FrozenTextEncoder
-├── scripts/
-│   ├── train_mid.py             # DDP training loop (NCCL) + alignment checkpointing
-│   ├── evaluate.py              # ImageNet zero-shot · Flickr30k retrieval · CIFAR-100 probe
-│   ├── viz_saliency.py          # Saliency-map visualization for any checkpoint
-│   └── smoke_test_mid.py        # 5-step sanity check (183.5M params)
-├── configs/
-│   ├── keural_mid_2xh200.yaml   # Primary training config (2× H200)
-│   └── keural_mid_smoke.yaml    # Smoke test config (synthetic data)
-├── keural_mid_config.py         # Typed config dataclasses (YAML → Python)
-├── PIPELINE_TECHNICAL_SPEC.md   # Full reverse-engineered technical specification
-├── ARCHITECTURE_AUDIT.md        # Production audit: findings + severity + repair plan
-└── pipeline_diagram.html        # Self-contained animated pipeline diagram
-```
+├── <a href="architecture/">architecture/</a>
+│   ├── <a href="architecture/encoder.py">encoder.py</a>               # KeuralVisionEncoder — main model
+│   └── <a href="architecture/spatial/">spatial/</a>
+│       ├── <a href="architecture/spatial/block.py">block.py</a>             # SpatialBlock (RMSNorm, SwiGLU, 2D-RoPE, scale bias)
+│       └── <a href="architecture/spatial/rope_2d.py">rope_2d.py</a>           # Continuous 2D rotary position encoding
+├── <a href="tokenizer/">tokenizer/</a>
+│   ├── <a href="tokenizer/stem.py">stem.py</a>                  # CNN stem (4-stage strided conv)
+│   ├── <a href="tokenizer/saliency.py">saliency.py</a>              # Saliency predictor (2-conv head)
+│   ├── <a href="tokenizer/atb_tokenizer.py">atb_tokenizer.py</a>         # ATB orchestrator: budget split + curriculum
+│   ├── <a href="tokenizer/region_sampler.py">region_sampler.py</a>        # Gumbel-Top-K + NMS + straight-through sampling
+│   └── <a href="tokenizer/token_constructor.py">token_constructor.py</a>     # Global cross-attention + region/detail constructors
+├── <a href="training/">training/</a>
+│   ├── <a href="training/losses.py">losses.py</a>                # SigLIP + HCT + saliency + distillation loss
+│   ├── <a href="training/distillation.py">distillation.py</a>          # Frozen teacher wrappers (SigLIP, InternViT)
+│   └── <a href="training/distributed.py">distributed.py</a>           # Gradient-preserving all_gather · rank sync helpers
+├── <a href="alignment/">alignment/</a>
+│   ├── <a href="alignment/hf_wrapper.py">hf_wrapper.py</a>            # HuggingFace PreTrainedModel wrapper
+│   └── <a href="alignment/output_contract.py">output_contract.py</a>       # KeuralEncoderOutput dataclass
+├── <a href="data/">data/</a>
+│   └── <a href="data/datasets.py">datasets.py</a>              # WebDataset-tar datasets · BucketedSampler · FrozenTextEncoder
+├── <a href="scripts/">scripts/</a>
+│   ├── <a href="scripts/train_mid.py">train_mid.py</a>             # DDP training loop (NCCL) + alignment checkpointing
+│   ├── <a href="scripts/evaluate.py">evaluate.py</a>              # ImageNet zero-shot · Flickr30k retrieval · CIFAR-100 probe
+│   ├── <a href="scripts/viz_saliency.py">viz_saliency.py</a>          # Saliency-map visualization for any checkpoint
+│   └── <a href="scripts/smoke_test_mid.py">smoke_test_mid.py</a>        # 5-step sanity check (183.5M params)
+├── <a href="configs/">configs/</a>
+│   ├── <a href="configs/keural_mid_2xh200.yaml">keural_mid_2xh200.yaml</a>   # Primary training config (2× H200)
+│   └── <a href="configs/keural_mid_smoke.yaml">keural_mid_smoke.yaml</a>    # Smoke test config (synthetic data)
+├── <a href="keural_mid_config.py">keural_mid_config.py</a>         # Typed config dataclasses (YAML → Python)
+├── <a href="PIPELINE_TECHNICAL_SPEC.md">PIPELINE_TECHNICAL_SPEC.md</a>   # Full reverse-engineered technical specification
+├── <a href="ARCHITECTURE_AUDIT.md">ARCHITECTURE_AUDIT.md</a>        # Production audit: findings + severity + repair plan
+└── <a href="pipeline_diagram.html">pipeline_diagram.html</a>        # Self-contained animated pipeline diagram
+</pre>
 
 ---
 

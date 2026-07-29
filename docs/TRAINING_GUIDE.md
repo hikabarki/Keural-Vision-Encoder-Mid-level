@@ -137,7 +137,7 @@ tail -f outputs/stage2a.log
 |---|---|---|
 | LR | 1e-3 | High — the projector is training from random init |
 | Steps | 5,000 | Warm-up only; convergence is fast |
-| Batch / accum | 8 / 4 (eff. 32) | Estimate — see §4.1 if it OOMs |
+| Batch / accum | 16 / 2 (eff. 32) | ~36% of one H200 — see §4.1 |
 | Precision | bf16 + LoRA | Not 4-bit; see §4.3 |
 
 **What healthy looks like:** loss drops steeply in the first few hundred steps
@@ -168,6 +168,7 @@ tail -f outputs/stage2b_bilingual.log
 | LR | 2e-5 | **Much lower than 2a** — a high LR here destroys 2a's alignment |
 | Steps | 8,000 (EN) / 12,000 (bilingual) | Bilingual has 3.3× the data |
 | Max length | 512 | Multi-turn conversations are longer than captions |
+| Batch / accum | 8 / 4 (eff. 32) | ~34% of one H200 — see §4.1 |
 
 Labels are masked to **assistant turns only** — the model learns to answer, not
 to echo the question. This is handled in `data/vlm_dataset.build_llava_batch`

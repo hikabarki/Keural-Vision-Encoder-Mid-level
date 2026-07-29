@@ -15,7 +15,7 @@ DATA=/home/work/keural-model/vlm-datasets
 OUT=outputs/projector_2b
 STAGE2A=outputs/projector_2a
 
-USED=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits | paste -sd+ | bc)
+USED=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits | awk '{s+=$1} END {print s+0}')
 if [ "$USED" -gt 20000 ]; then
   echo "ABORT: GPUs still in use (${USED} MiB allocated)."
   exit 1

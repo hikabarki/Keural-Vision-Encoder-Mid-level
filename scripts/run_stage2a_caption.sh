@@ -14,7 +14,7 @@ DATA=/home/work/keural-model/vlm-datasets
 OUT=outputs/projector_2a
 
 # Pre-flight: don't launch onto busy GPUs.
-USED=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits | paste -sd+ | bc)
+USED=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits | awk '{s+=$1} END {print s+0}')
 if [ "$USED" -gt 20000 ]; then
   echo "ABORT: GPUs still in use (${USED} MiB allocated). Wait for the other job to finish."
   nvidia-smi --query-compute-apps=pid,used_memory --format=csv

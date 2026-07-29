@@ -207,12 +207,31 @@ watch -n5 nvidia-smi
 
 ### 4.1 CUDA out of memory
 
-Batch sizes in the launch scripts are **estimates** — they were not measured on
-free GPUs. If a run OOMs, halve the micro-batch and double accumulation to keep
-the effective batch constant:
+VRAM was profiled before launch (encoder side measured under a hard memory cap;
+LLM weights are exact; activations estimated):
+
+| Component | GiB | Source |
+|---|---|---|
+| Qwen2.5-7B weights (bf16) | 14.2 | exact |
+| Encoder + projector @ batch 8 | 0.62 | **measured** |
+| Activations | 4.18 MiB / token | estimated |
+
+Projected peak on one 141 GiB H200:
+
+| Stage | Batch | Seq | Total | Utilization |
+|---|---|---|---|---|
+| 2a | 16 | 544 | ~50 GiB | 36% |
+| 2b | 8 | 1024 | ~48 GiB | 34% |
+
+Both configs sit near a third of one card, so there is roughly 2× headroom even
+if the activation estimate is off by a factor of two.
+
+If a run OOMs anyway, halve the micro-batch and double accumulation to keep the
+effective batch (32) constant:
 
 ```bash
---batch-size 4 --grad-accum 8     # instead of 8 / 4
+--batch-size 8 --grad-accum 4     # 2a fallback
+--batch-size 4 --grad-accum 8     # 2b fallback
 ```
 
 ### 4.2 Low GPU utilization

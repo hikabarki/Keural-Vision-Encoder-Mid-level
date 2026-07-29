@@ -39,8 +39,8 @@ nohup python3 scripts/train_projector.py \
   --output-dir "$OUT" \
   --token-budget 512 \
   --image-size 384 \
-  --batch-size 8 \
-  --grad-accum 4 \
+  --batch-size 16 \
+  --grad-accum 2 \
   --lr 1e-3 \
   --warmup-steps 200 \
   --max-steps 5000 \

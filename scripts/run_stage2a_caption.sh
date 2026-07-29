@@ -38,7 +38,7 @@ nohup python3 scripts/train_projector.py \
   --image-root "$DATA/llava-pretrain/images" \
   --output-dir "$OUT" \
   --token-budget 512 \
-  --image-size 384 \
+  --image-size 512 \
   --batch-size 16 \
   --grad-accum 2 \
   --lr 1e-3 \

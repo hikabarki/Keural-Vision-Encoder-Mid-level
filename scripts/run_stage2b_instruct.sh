@@ -48,7 +48,7 @@ nohup python3 scripts/train_projector.py \
   --image-root "$DATA/coco/train2017" \
   --output-dir "$OUT" \
   --token-budget 512 \
-  --image-size 384 \
+  --image-size 512 \
   --batch-size 8 \
   --grad-accum 4 \
   --lr 2e-5 \

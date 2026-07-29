@@ -91,6 +91,15 @@ at 384px), which the model was never trained on. See
 Final results: 37.2% ImageNet zero-shot Top-1, 42.9%/42.2% Flickr30K R@1,
 75.0% CIFAR-100 linear probe.
 
+> **Resolution.** Those numbers were measured at **384x384**, the Stage 1
+> training resolution. `evaluate.py` now takes `--image-size`, so a run at
+> another resolution is possible — but any result must be reported with the
+> resolution it was measured at, and results files are suffixed (`_res512`) so
+> runs cannot silently overwrite each other. Note the ImageNet/Flickr30K eval
+> data has since been deleted, so re-measuring the encoder at a new resolution
+> requires re-acquiring it first; the VLM benchmarks (POPE/VQAv2/MME) stream
+> from HuggingFace and are unaffected.
+
 ---
 
 ## 2. Stage 2 — VLM Alignment
@@ -139,6 +148,16 @@ tail -f outputs/stage2a.log
 | Steps | 5,000 | Warm-up only; convergence is fast |
 | Batch / accum | 16 / 2 (eff. 32) | ~36% of one H200 — see §4.1 |
 | Precision | bf16 + LoRA | Not 4-bit; see §4.3 |
+| Image size | 512x512 | See the resolution note below |
+
+> **Why 512x512 for Stage 2.** The encoder was pretrained at 384 and 448, but
+> accepts any multiple of 16 natively (continuous 2D-RoPE + a runtime token
+> budget — no position interpolation needed). Stage 2 runs at 512 with
+> `--token-budget 512` held constant, so the token count and therefore the
+> compute are unchanged; the tokens are simply sampled from a finer 32x32 grid
+> instead of 24x24. 512 is a mild step up from the 448 already seen in
+> training. This behaviour is **not yet measured** — run POPE at both 384 and
+> 512 before quoting either.
 
 **What healthy looks like:** loss drops steeply in the first few hundred steps
 (the projector finding the embedding space), then flattens. Checkpoints land in

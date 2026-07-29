@@ -30,6 +30,8 @@ Attention Heads:     12 (head_dim=64)
 Token Budget:        512 default, up to 2048
 Precision:           bfloat16
 Input:               RGB image, any resolution (multiple of 16)
+                     Stage 1 pretrained at 384x384 and 448x448
+                     Stage 2 (VLM) runs at 512x512
 ```
 
 ---

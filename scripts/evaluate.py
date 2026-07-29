@@ -132,7 +132,7 @@ def encode_images(model, dataloader, device, token_budget=None) -> torch.Tensor:
 # Benchmark 1: Zero-shot ImageNet Classification
 # ---------------------------------------------------------------------------
 
-def eval_imagenet(model, device, text_encoder, batch_size=128, data_root=None, token_budget=None):
+def eval_imagenet(model, device, text_encoder, batch_size=128, data_root=None, token_budget=None, image_size=384):
     """Zero-shot ImageNet classification using CLIP-style text prompts.
 
     ``text_encoder`` is an _EvalTextEncoder that applies the trained text
@@ -178,8 +178,8 @@ def eval_imagenet(model, device, text_encoder, batch_size=128, data_root=None, t
 
     # Image transforms
     transform = transforms.Compose([
-        transforms.Resize(384, interpolation=transforms.InterpolationMode.BICUBIC),
-        transforms.CenterCrop(384),
+        transforms.Resize(image_size, interpolation=transforms.InterpolationMode.BICUBIC),
+        transforms.CenterCrop(image_size),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
@@ -249,7 +249,7 @@ def eval_imagenet(model, device, text_encoder, batch_size=128, data_root=None, t
 # Benchmark 2: Image-Text Retrieval (Flickr30k)
 # ---------------------------------------------------------------------------
 
-def eval_flickr30k(model, device, text_encoder, batch_size=128, data_root=None, token_budget=None):
+def eval_flickr30k(model, device, text_encoder, batch_size=128, data_root=None, token_budget=None, image_size=384):
     """Image-text retrieval on Flickr30k test split.
 
     ``text_encoder`` applies the trained text projection (training space).
@@ -293,8 +293,8 @@ def eval_flickr30k(model, device, text_encoder, batch_size=128, data_root=None, 
     print(f"[eval] Flickr30k: {len(image_names)} test images")
 
     transform = transforms.Compose([
-        transforms.Resize(384, interpolation=transforms.InterpolationMode.BICUBIC),
-        transforms.CenterCrop(384),
+        transforms.Resize(image_size, interpolation=transforms.InterpolationMode.BICUBIC),
+        transforms.CenterCrop(image_size),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
@@ -363,7 +363,7 @@ def eval_flickr30k(model, device, text_encoder, batch_size=128, data_root=None, 
 # Benchmark 3: Linear Probe on CIFAR-100
 # ---------------------------------------------------------------------------
 
-def eval_cifar100(model, device, batch_size=256, token_budget=None):
+def eval_cifar100(model, device, batch_size=256, token_budget=None, image_size=384):
     """Linear probe classification on CIFAR-100."""
     print("\n" + "=" * 60)
     print("  Benchmark: CIFAR-100 Linear Probe")
@@ -376,8 +376,8 @@ def eval_cifar100(model, device, batch_size=256, token_budget=None):
         return None
 
     transform = transforms.Compose([
-        transforms.Resize(384, interpolation=transforms.InterpolationMode.BICUBIC),
-        transforms.CenterCrop(384),
+        transforms.Resize(image_size, interpolation=transforms.InterpolationMode.BICUBIC),
+        transforms.CenterCrop(image_size),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
@@ -465,6 +465,10 @@ def main():
     parser.add_argument("--imagenet-path", type=str, default=None, help="Path to ImageNet val/")
     parser.add_argument("--flickr-path", type=str, default=None, help="Path to Flickr30k/")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--image-size", type=int, default=384,
+                        help="Square eval resolution. Training used 384 and 448; "
+                        "the encoder accepts any multiple of 16. Changing this changes "
+                        "the numbers, so report it alongside any result.")
     parser.add_argument("--token-budget", type=int, default=None,
                         help="Fixed token budget to use (e.g. 512 to match training, which "
                              "always used config.tokenizer.default_token_budget rather than "
@@ -480,23 +484,25 @@ def main():
     needs_text = any(b in args.benchmarks for b in ("imagenet", "flickr30k"))
     text_encoder = _EvalTextEncoder(args.checkpoint, device) if needs_text else None
 
-    all_results = {"checkpoint": args.checkpoint, "token_budget": args.token_budget}
+    all_results = {"checkpoint": args.checkpoint, "token_budget": args.token_budget,
+                   "image_size": args.image_size}
     t0 = time.time()
 
     if "imagenet" in args.benchmarks:
         result = eval_imagenet(model, device, text_encoder, args.batch_size, args.imagenet_path,
-                                token_budget=args.token_budget)
+                                token_budget=args.token_budget, image_size=args.image_size)
         if result:
             all_results.update(result)
 
     if "flickr30k" in args.benchmarks:
         result = eval_flickr30k(model, device, text_encoder, args.batch_size, args.flickr_path,
-                                 token_budget=args.token_budget)
+                                 token_budget=args.token_budget, image_size=args.image_size)
         if result:
             all_results.update(result)
 
     if "cifar100" in args.benchmarks:
-        result = eval_cifar100(model, device, args.batch_size, token_budget=args.token_budget)
+        result = eval_cifar100(model, device, args.batch_size, token_budget=args.token_budget,
+                               image_size=args.image_size)
         if result:
             all_results.update(result)
 
@@ -508,16 +514,19 @@ def main():
     print("  EVALUATION SUMMARY")
     print("=" * 60)
     for k, v in all_results.items():
-        if k not in ("checkpoint", "eval_time_s", "token_budget"):
+        if k not in ("checkpoint", "eval_time_s", "token_budget", "image_size"):
             print(f"  {k:25s} : {v:.2f}%")
     print(f"\n  Checkpoint: {args.checkpoint}")
     print(f"  Token budget: {args.token_budget if args.token_budget is not None else 'auto (resolution-scaled)'}")
+    print(f"  Image size:   {args.image_size}x{args.image_size}")
     print(f"  Time: {elapsed:.0f}s")
     print("=" * 60)
 
     # Save results. Suffix the filename by token budget so a fixed-budget rerun
     # never clobbers the default auto-scaled eval_results.json already on disk.
     suffix = f"_budget{args.token_budget}" if args.token_budget is not None else ""
+    if args.image_size != 384:
+        suffix += f"_res{args.image_size}"
     results_path = Path(args.checkpoint) / f"eval_results{suffix}.json"
     with open(results_path, "w") as f:
         json.dump(all_results, f, indent=2)

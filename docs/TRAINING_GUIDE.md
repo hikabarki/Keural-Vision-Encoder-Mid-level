@@ -303,19 +303,58 @@ what training used (default 2048).
 ### 5.2 Benchmarks
 
 ```bash
-# hallucination — the most informative one for an undertrained encoder
-python3 scripts/eval_vlm.py --benchmark pope \
-  --projector-ckpt outputs/projector_2b_bilingual/checkpoint-12000/projector.pt \
-  --lora-ckpt      outputs/projector_2b_bilingual/checkpoint-12000/lora_adapter \
-  --limit 500
+P=outputs/projector_2b_bilingual/checkpoint-12000
 
-# open-ended VQA
-python3 scripts/eval_vlm.py --benchmark vqav2 --projector-ckpt ... --limit 1000
+python3 scripts/eval_vlm.py --benchmark pope \
+  --projector-ckpt $P/projector.pt --lora-ckpt $P/lora_adapter --limit 500
 ```
 
-Datasets stream from the HuggingFace hub — no manual preparation. Use `--limit`
-for a quick signal first; drop it for a full run. Results are written to
+| Benchmark | Measures |
+|---|---|
+| `pope` | Object hallucination (yes/no) — accuracy, F1, **yes-ratio** |
+| `vqav2` | Open-ended VQA, standard soft accuracy |
+| `mme` | 14 perception/cognition subtasks, per-category + MME score |
+| `mmbench` | Multiple choice (A/B/C/D) — robust to answer parsing |
+| `heldout` | **Loss/perplexity on our own held-out split, EN and KO separately** |
+
+The first four stream from the HuggingFace hub — no manual preparation. Use
+`--limit` for a quick signal, drop it for a full run. Results land in
 `outputs/eval_<benchmark>.json`.
+
+#### Run the blind baseline — this is not optional
+
+VQAv2 and MME are substantially answerable from language priors alone. A model
+that never sees the image can score ~40% on VQAv2 by exploiting question
+statistics. So run each benchmark **twice**:
+
+```bash
+python3 scripts/eval_vlm.py --benchmark vqav2 --projector-ckpt $P/projector.pt --limit 1000
+python3 scripts/eval_vlm.py --benchmark vqav2 --projector-ckpt $P/projector.pt --limit 1000 --no-vision
+```
+
+```
+vision_score  -  blind_score  =  what the vision pipeline actually contributes
+```
+
+If that gap is near zero, the encoder and projector are not helping no matter
+how respectable the headline number looks. Given this encoder is undertrained
+(37.2% zero-shot ImageNet), the gap is the number that matters. Blind runs are
+saved separately as `outputs/eval_<benchmark>_blind.json`.
+
+#### Korean evaluation
+
+No public Korean VLM benchmark exists, and the bilingual run is ~70% Korean —
+so without `heldout` the majority of training would be unmeasured. It scores
+teacher-forced loss and perplexity on the 1,000 held-out EN and 1,000 held-out
+KO records reserved when the JSONLs were built, reported per language:
+
+```bash
+python3 scripts/eval_vlm.py --benchmark heldout --projector-ckpt $P/projector.pt --limit 500
+```
+
+Expect Korean perplexity to be higher than English — Korean is the harder
+language for a primarily-English-pretrained LLM. Watch the *trend* across
+checkpoints rather than the absolute value.
 
 > **Read the POPE yes-ratio, not just accuracy.** A model that answers "yes" to
 > every question scores ~50% accuracy with a yes-ratio near 1.0. The script

@@ -219,6 +219,8 @@ L_total = L_SigLIP + λ_hct·L_HCT + λ_sal·β_sal·L_saliency + L_distill
 | Doc | Contents |
 |---|---|
 | [`PIPELINE_TECHNICAL_SPEC.md`](docs/PIPELINE_TECHNICAL_SPEC.md) | Complete module-by-module spec: shapes, equations, execution timeline |
+| [`TRAINING_GUIDE.md`](docs/TRAINING_GUIDE.md) | Step-by-step runbook: Stage 1 → Stage 2a → Stage 2b, monitoring, troubleshooting |
+| [`OCR_ROADMAP.md`](docs/OCR_ROADMAP.md) | Scoping for document/OCR support: measured constraints and options |
 | [`ARCHITECTURE_AUDIT.md`](docs/ARCHITECTURE_AUDIT.md) | Full correctness audit with severity ranking and repair plan |
 | [`pipeline_diagram.html`](assets/pipeline_diagram.html) | Self-contained animated block diagram (open in any browser) |
 | [🤗 Model card](https://huggingface.co/mkd-hika/keural-vision-encoder-mid) | Usage, output contract, teacher table, roadmap |

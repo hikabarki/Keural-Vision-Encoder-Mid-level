@@ -23,7 +23,7 @@
 
 <br/>
 
-![Animated training pipeline](assets/pipeline_preview.gif)
+![Keural Mid architecture](assets/keural_mid_architecture.png)
 
 </div>
 
@@ -141,7 +141,7 @@ mid/
 │   └── <a href="docs/figures/">figures/</a>                  # Benchmark charts, loss curves, saliency figures
 ├── <a href="assets/">assets/</a>
 │   ├── <a href="assets/pipeline_diagram.html">pipeline_diagram.html</a>      # Self-contained animated pipeline diagram
-│   ├── <a href="assets/pipeline_preview.gif">pipeline_preview.gif</a>       # Animated pipeline preview
+│   ├── <a href="assets/keural_mid_architecture.png">keural_mid_architecture.png</a>  # Full architecture specification figure
 │   └── <a href="assets/keural-logo.svg">keural-logo.svg</a>            # Brand mark
 ├── <a href="keural_mid_config.py">keural_mid_config.py</a>         # Typed config dataclasses (YAML → Python)
 ├── <a href="requirements.txt">requirements.txt</a>

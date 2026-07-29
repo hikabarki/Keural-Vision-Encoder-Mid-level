@@ -278,11 +278,54 @@ cat /sys/fs/cgroup/memory.events   # oom_kill counter
 
 ## 5. Evaluating the VLM
 
-The PoC repository (`../tiny-reference/VISION-ENCODER_tiny-main/scripts/`)
-contains `eval_vqa.py`, `eval_pope.py`, and `eval_mme.py`. These have **not**
-yet been ported to Mid — they target the PoC's 384-dim encoder and Mistral
-decoder, so they need the same dimension updates that `train_projector.py`
-received.
+### 5.1 First — look at the output (do this before any benchmark)
+
+A loss curve does not tell you whether the model emits coherent text. As soon
+as Stage 2a or 2b writes a checkpoint:
+
+```bash
+python3 scripts/demo_vlm.py \
+  --projector-ckpt outputs/projector_2a/checkpoint-5000/projector.pt \
+  --lora-ckpt      outputs/projector_2a/checkpoint-5000/lora_adapter \
+  --image /path/to/photo.jpg \
+  --question "What is in this image?"
+```
+
+Interactive mode (`--chat`) keeps asking about the same image. Korean works
+too — just ask in Korean after the bilingual run.
+
+**Expectations:** after **2a** the model captions but does not follow
+instructions — that is correct, instruction-following comes from 2b. After
+**2b** it should answer questions directly. Output that ignores the image
+entirely means the projector is not aligned; check that `--hidden-dim` matches
+what training used (default 2048).
+
+### 5.2 Benchmarks
+
+```bash
+# hallucination — the most informative one for an undertrained encoder
+python3 scripts/eval_vlm.py --benchmark pope \
+  --projector-ckpt outputs/projector_2b_bilingual/checkpoint-12000/projector.pt \
+  --lora-ckpt      outputs/projector_2b_bilingual/checkpoint-12000/lora_adapter \
+  --limit 500
+
+# open-ended VQA
+python3 scripts/eval_vlm.py --benchmark vqav2 --projector-ckpt ... --limit 1000
+```
+
+Datasets stream from the HuggingFace hub — no manual preparation. Use `--limit`
+for a quick signal first; drop it for a full run. Results are written to
+`outputs/eval_<benchmark>.json`.
+
+> **Read the POPE yes-ratio, not just accuracy.** A model that answers "yes" to
+> every question scores ~50% accuracy with a yes-ratio near 1.0. The script
+> reports both, plus how many answers were unparseable.
+
+### 5.3 Not yet ported
+
+`eval_mme.py` and the GUI tools remain in the PoC repo
+(`../tiny-reference/VISION-ENCODER_tiny-main/scripts/`) and still target the
+384-dim encoder and Mistral decoder.
 
 ---
 

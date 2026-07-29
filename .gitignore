@@ -34,3 +34,10 @@ Thumbs.db
 *.log
 nohup.out
 *.docx
+
+# Local-only report documents (Word)
+docs/reports/
+
+# Reference copies of other projects (keep out of this repo)
+VISION-ENCODER_tiny-main/
+tiny-reference/

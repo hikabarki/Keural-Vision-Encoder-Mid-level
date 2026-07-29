@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="keural-logo.svg" alt="Keural logo" width="104" height="104">
+<img src="assets/keural-logo.svg" alt="Keural logo" width="104" height="104">
 
 # Keural Mid-Level Vision Encoder
 
@@ -18,12 +18,12 @@
 
 [**🤗 Model**](https://huggingface.co/mkd-hika/keural-vision-encoder-mid) ·
 [**🎬 Interactive Pipeline Diagram**](https://huggingface.co/spaces/mkd-hika/keural-vision-encoder-diagram) ·
-[**📐 Technical Spec**](PIPELINE_TECHNICAL_SPEC.md) ·
-[**🔍 Architecture Audit**](ARCHITECTURE_AUDIT.md)
+[**📐 Technical Spec**](docs/PIPELINE_TECHNICAL_SPEC.md) ·
+[**🔍 Architecture Audit**](docs/ARCHITECTURE_AUDIT.md)
 
 <br/>
 
-![Animated training pipeline](pipeline_preview.gif)
+![Animated training pipeline](assets/pipeline_preview.gif)
 
 </div>
 
@@ -115,21 +115,37 @@ mid/
 │   └── <a href="training/distributed.py">distributed.py</a>           # Gradient-preserving all_gather · rank sync helpers
 ├── <a href="alignment/">alignment/</a>
 │   ├── <a href="alignment/hf_wrapper.py">hf_wrapper.py</a>            # HuggingFace PreTrainedModel wrapper
-│   └── <a href="alignment/output_contract.py">output_contract.py</a>       # KeuralEncoderOutput dataclass
+│   ├── <a href="alignment/output_contract.py">output_contract.py</a>       # KeuralEncoderOutput dataclass
+│   ├── <a href="alignment/projectors.py">projectors.py</a>            # Simple / LevelAware / Metadata projectors → LLM
+│   └── <a href="alignment/vlm_helpers.py">vlm_helpers.py</a>           # build_vlm_inputs (vision+text splice)
 ├── <a href="data/">data/</a>
-│   └── <a href="data/datasets.py">datasets.py</a>              # WebDataset-tar datasets · BucketedSampler · FrozenTextEncoder
+│   ├── <a href="data/datasets.py">datasets.py</a>              # WebDataset-tar datasets · BucketedSampler · FrozenTextEncoder
+│   └── <a href="data/vlm_dataset.py">vlm_dataset.py</a>           # Stage 2 VLM streams (caption + LLaVA instruction)
 ├── <a href="scripts/">scripts/</a>
 │   ├── <a href="scripts/train_mid.py">train_mid.py</a>             # DDP training loop (NCCL) + alignment checkpointing
 │   ├── <a href="scripts/evaluate.py">evaluate.py</a>              # ImageNet zero-shot · Flickr30k retrieval · CIFAR-100 probe
 │   ├── <a href="scripts/viz_saliency.py">viz_saliency.py</a>          # Saliency-map visualization for any checkpoint
-│   └── <a href="scripts/smoke_test_mid.py">smoke_test_mid.py</a>        # 5-step sanity check (183.5M params)
+│   ├── <a href="scripts/smoke_test_mid.py">smoke_test_mid.py</a>        # 5-step sanity check (183.5M params)
+│   └── <a href="scripts/train_projector.py">train_projector.py</a>       # Stage 2: projector/LoRA alignment to an LLM
 ├── <a href="configs/">configs/</a>
 │   ├── <a href="configs/keural_mid_2xh200.yaml">keural_mid_2xh200.yaml</a>   # Primary training config (2× H200)
 │   └── <a href="configs/keural_mid_smoke.yaml">keural_mid_smoke.yaml</a>    # Smoke test config (synthetic data)
+├── <a href="docs/">docs/</a>
+│   ├── <a href="docs/PIPELINE_TECHNICAL_SPEC.md">PIPELINE_TECHNICAL_SPEC.md</a>  # Full reverse-engineered technical specification
+│   ├── <a href="docs/ARCHITECTURE.md">ARCHITECTURE.md</a>            # Architecture reference
+│   ├── <a href="docs/ARCHITECTURE_AUDIT.md">ARCHITECTURE_AUDIT.md</a>      # Production audit: findings + severity + repair plan
+│   ├── <a href="docs/BENCHMARK_COMPARISON.md">BENCHMARK_COMPARISON.md</a>    # Evaluation results vs. teachers and peers
+│   ├── <a href="docs/KEURAL_TINY_VS_MID.md">KEURAL_TINY_VS_MID.md</a>      # PoC (24.7M) vs Mid (183.5M) comparison
+│   ├── <a href="docs/DATASET_INFO.md">DATASET_INFO.md</a>            # Dataset composition and provenance
+│   ├── <a href="docs/DATASET_DOWNLOAD.md">DATASET_DOWNLOAD.md</a>        # Dataset acquisition instructions
+│   └── <a href="docs/figures/">figures/</a>                  # Benchmark charts, loss curves, saliency figures
+├── <a href="assets/">assets/</a>
+│   ├── <a href="assets/pipeline_diagram.html">pipeline_diagram.html</a>      # Self-contained animated pipeline diagram
+│   ├── <a href="assets/pipeline_preview.gif">pipeline_preview.gif</a>       # Animated pipeline preview
+│   └── <a href="assets/keural-logo.svg">keural-logo.svg</a>            # Brand mark
 ├── <a href="keural_mid_config.py">keural_mid_config.py</a>         # Typed config dataclasses (YAML → Python)
-├── <a href="PIPELINE_TECHNICAL_SPEC.md">PIPELINE_TECHNICAL_SPEC.md</a>   # Full reverse-engineered technical specification
-├── <a href="ARCHITECTURE_AUDIT.md">ARCHITECTURE_AUDIT.md</a>        # Production audit: findings + severity + repair plan
-└── <a href="pipeline_diagram.html">pipeline_diagram.html</a>        # Self-contained animated pipeline diagram
+├── <a href="requirements.txt">requirements.txt</a>
+└── <a href="setup_venv.sh">setup_venv.sh</a>
 </pre>
 
 ---
@@ -202,9 +218,9 @@ L_total = L_SigLIP + λ_hct·L_HCT + λ_sal·β_sal·L_saliency + L_distill
 
 | Doc | Contents |
 |---|---|
-| [`PIPELINE_TECHNICAL_SPEC.md`](PIPELINE_TECHNICAL_SPEC.md) | Complete module-by-module spec: shapes, equations, execution timeline |
-| [`ARCHITECTURE_AUDIT.md`](ARCHITECTURE_AUDIT.md) | Full correctness audit with severity ranking and repair plan |
-| [`pipeline_diagram.html`](pipeline_diagram.html) | Self-contained animated block diagram (open in any browser) |
+| [`PIPELINE_TECHNICAL_SPEC.md`](docs/PIPELINE_TECHNICAL_SPEC.md) | Complete module-by-module spec: shapes, equations, execution timeline |
+| [`ARCHITECTURE_AUDIT.md`](docs/ARCHITECTURE_AUDIT.md) | Full correctness audit with severity ranking and repair plan |
+| [`pipeline_diagram.html`](assets/pipeline_diagram.html) | Self-contained animated block diagram (open in any browser) |
 | [🤗 Model card](https://huggingface.co/mkd-hika/keural-vision-encoder-mid) | Usage, output contract, teacher table, roadmap |
 
 ---

@@ -96,6 +96,9 @@ training:
 
 data:
   dataset_name: cc3m
+  # NOTE: this path no longer exists — the DataComp/COYO training corpus was
+  # deleted after the Stage 1 run finished. Re-running Stage 1 requires
+  # re-acquiring the data and updating these two paths. See docs/TRAINING_GUIDE.md.
   images_root: /home/work/keural-model/vision-encoder-dataset/datacomp_medium
   captions_path: /home/work/keural-model/vision-encoder-dataset/indexes/datacomp_train.tsv
   extra_sources: []

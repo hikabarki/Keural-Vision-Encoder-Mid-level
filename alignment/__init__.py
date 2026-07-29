@@ -23,6 +23,13 @@ from alignment.output_contract import (
     KeuralEncoderOutput,
     empty_output,
 )
+from alignment.projectors import (
+    KeuralProjectorBase,
+    LevelAwareProjector,
+    MetadataProjector,
+    SimpleProjector,
+)
+from alignment.vlm_helpers import VLMInputs, build_vlm_inputs
 
 __all__ = [
     "KeuralEncoderOutput",
@@ -32,4 +39,12 @@ __all__ = [
     "LEVEL_NAMES",
     "NUM_LEVELS",
     "empty_output",
+    # Projectors (ported from PoC, adapted for Mid's 768-dim encoder)
+    "KeuralProjectorBase",
+    "SimpleProjector",
+    "LevelAwareProjector",
+    "MetadataProjector",
+    # VLM helpers
+    "VLMInputs",
+    "build_vlm_inputs",
 ]

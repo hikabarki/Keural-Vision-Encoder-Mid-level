@@ -112,7 +112,7 @@ class _EvalTextEncoder:
 
 
 @torch.no_grad()
-def encode_images(model, dataloader, device) -> torch.Tensor:
+def encode_images(model, dataloader, device, token_budget=None) -> torch.Tensor:
     """Encode all images through the model, return pooled embeddings."""
     all_embeds = []
     for batch in tqdm(dataloader, desc="Encoding images"):
@@ -122,7 +122,7 @@ def encode_images(model, dataloader, device) -> torch.Tensor:
             images = batch["pixel_values"].to(device)
         else:
             images = batch.to(device)
-        out = model(pixel_values=images)
+        out = model(pixel_values=images, token_budget=token_budget)
         pooled = F.normalize(out.pooled, dim=-1)
         all_embeds.append(pooled.cpu())
     return torch.cat(all_embeds, dim=0)
@@ -132,7 +132,7 @@ def encode_images(model, dataloader, device) -> torch.Tensor:
 # Benchmark 1: Zero-shot ImageNet Classification
 # ---------------------------------------------------------------------------
 
-def eval_imagenet(model, device, text_encoder, batch_size=128, data_root=None):
+def eval_imagenet(model, device, text_encoder, batch_size=128, data_root=None, token_budget=None):
     """Zero-shot ImageNet classification using CLIP-style text prompts.
 
     ``text_encoder`` is an _EvalTextEncoder that applies the trained text
@@ -228,7 +228,7 @@ def eval_imagenet(model, device, text_encoder, batch_size=128, data_root=None):
         batch_tensor = torch.stack([transform(img) for img in batch_imgs]).to(device)
 
         with torch.no_grad():
-            out = model(pixel_values=batch_tensor)
+            out = model(pixel_values=batch_tensor, token_budget=token_budget)
             img_embeds = F.normalize(out.pooled, dim=-1)
             logits = img_embeds @ class_embeds.T
 
@@ -249,7 +249,7 @@ def eval_imagenet(model, device, text_encoder, batch_size=128, data_root=None):
 # Benchmark 2: Image-Text Retrieval (Flickr30k)
 # ---------------------------------------------------------------------------
 
-def eval_flickr30k(model, device, text_encoder, batch_size=128, data_root=None):
+def eval_flickr30k(model, device, text_encoder, batch_size=128, data_root=None, token_budget=None):
     """Image-text retrieval on Flickr30k test split.
 
     ``text_encoder`` applies the trained text projection (training space).
@@ -310,7 +310,7 @@ def eval_flickr30k(model, device, text_encoder, batch_size=128, data_root=None):
             batch_imgs.append(transform(img))
         batch_tensor = torch.stack(batch_imgs).to(device)
         with torch.no_grad():
-            out = model(pixel_values=batch_tensor)
+            out = model(pixel_values=batch_tensor, token_budget=token_budget)
             embeds = F.normalize(out.pooled, dim=-1)
         all_img_embeds.append(embeds.cpu())
     img_embeds = torch.cat(all_img_embeds, dim=0)
@@ -363,7 +363,7 @@ def eval_flickr30k(model, device, text_encoder, batch_size=128, data_root=None):
 # Benchmark 3: Linear Probe on CIFAR-100
 # ---------------------------------------------------------------------------
 
-def eval_cifar100(model, device, batch_size=256):
+def eval_cifar100(model, device, batch_size=256, token_budget=None):
     """Linear probe classification on CIFAR-100."""
     print("\n" + "=" * 60)
     print("  Benchmark: CIFAR-100 Linear Probe")
@@ -395,7 +395,7 @@ def eval_cifar100(model, device, batch_size=256):
     for images, labels in tqdm(train_loader, desc="Train"):
         images = images.to(device)
         with torch.no_grad():
-            out = model(pixel_values=images)
+            out = model(pixel_values=images, token_budget=token_budget)
             pooled = out.pooled.cpu()
         train_features.append(pooled)
         train_labels.append(labels)
@@ -407,7 +407,7 @@ def eval_cifar100(model, device, batch_size=256):
     for images, labels in tqdm(test_loader, desc="Test"):
         images = images.to(device)
         with torch.no_grad():
-            out = model(pixel_values=images)
+            out = model(pixel_values=images, token_budget=token_budget)
             pooled = out.pooled.cpu()
         test_features.append(pooled)
         test_labels.append(labels)
@@ -465,6 +465,11 @@ def main():
     parser.add_argument("--imagenet-path", type=str, default=None, help="Path to ImageNet val/")
     parser.add_argument("--flickr-path", type=str, default=None, help="Path to Flickr30k/")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--token-budget", type=int, default=None,
+                        help="Fixed token budget to use (e.g. 512 to match training, which "
+                             "always used config.tokenizer.default_token_budget rather than "
+                             "resolution-based auto-scaling). Default: auto-scale by resolution "
+                             "(model's default inference behavior).")
     args = parser.parse_args()
 
     device = torch.device(args.device)
@@ -475,21 +480,23 @@ def main():
     needs_text = any(b in args.benchmarks for b in ("imagenet", "flickr30k"))
     text_encoder = _EvalTextEncoder(args.checkpoint, device) if needs_text else None
 
-    all_results = {"checkpoint": args.checkpoint}
+    all_results = {"checkpoint": args.checkpoint, "token_budget": args.token_budget}
     t0 = time.time()
 
     if "imagenet" in args.benchmarks:
-        result = eval_imagenet(model, device, text_encoder, args.batch_size, args.imagenet_path)
+        result = eval_imagenet(model, device, text_encoder, args.batch_size, args.imagenet_path,
+                                token_budget=args.token_budget)
         if result:
             all_results.update(result)
 
     if "flickr30k" in args.benchmarks:
-        result = eval_flickr30k(model, device, text_encoder, args.batch_size, args.flickr_path)
+        result = eval_flickr30k(model, device, text_encoder, args.batch_size, args.flickr_path,
+                                 token_budget=args.token_budget)
         if result:
             all_results.update(result)
 
     if "cifar100" in args.benchmarks:
-        result = eval_cifar100(model, device, args.batch_size)
+        result = eval_cifar100(model, device, args.batch_size, token_budget=args.token_budget)
         if result:
             all_results.update(result)
 
@@ -501,14 +508,17 @@ def main():
     print("  EVALUATION SUMMARY")
     print("=" * 60)
     for k, v in all_results.items():
-        if k not in ("checkpoint", "eval_time_s"):
+        if k not in ("checkpoint", "eval_time_s", "token_budget"):
             print(f"  {k:25s} : {v:.2f}%")
     print(f"\n  Checkpoint: {args.checkpoint}")
+    print(f"  Token budget: {args.token_budget if args.token_budget is not None else 'auto (resolution-scaled)'}")
     print(f"  Time: {elapsed:.0f}s")
     print("=" * 60)
 
-    # Save results
-    results_path = Path(args.checkpoint) / "eval_results.json"
+    # Save results. Suffix the filename by token budget so a fixed-budget rerun
+    # never clobbers the default auto-scaled eval_results.json already on disk.
+    suffix = f"_budget{args.token_budget}" if args.token_budget is not None else ""
+    results_path = Path(args.checkpoint) / f"eval_results{suffix}.json"
     with open(results_path, "w") as f:
         json.dump(all_results, f, indent=2)
     print(f"\n[eval] Results saved to {results_path}")

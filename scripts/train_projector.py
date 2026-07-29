@@ -50,26 +50,37 @@ import torchvision.transforms as T
 from PIL import Image
 
 import alignment.hf_wrapper  # registers KeuralVisionConfig/Model with AutoModel
-from transformers import (
-    AutoModel,
-    AutoModelForCausalLM,
-    AutoTokenizer,
-    BitsAndBytesConfig,
-)
-from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
+from peft import LoraConfig, get_peft_model
+# BitsAndBytesConfig / prepare_model_for_kbit_training are imported lazily inside
+# the loader only when 4-bit is requested — so the bf16 (--no-4bit) path works
+# even where bitsandbytes has no working CUDA binary.
 
 from alignment.projectors import LevelAwareProjector
+from data.vlm_dataset import (
+    caption_tar_stream, llava_json_stream, pull_batch,
+    build_caption_batch, build_llava_batch,
+)
 
 
 # -- args ----------------------------------------------------------------------
 parser = argparse.ArgumentParser(description="Stage 2 projector alignment training (Keural Mid)")
 parser.add_argument("--vision-ckpt", default="outputs/run/final",
                     help="Path to trained Stage 1 vision encoder checkpoint")
-parser.add_argument("--llm-name", default="google/gemma-2-2b-it",
+parser.add_argument("--llm-name", default="Qwen/Qwen2.5-7B-Instruct",
                     help="HF repo ID or local path to the LLM (any causal LM)")
 parser.add_argument("--output-dir", default="outputs/projector")
+parser.add_argument("--data-mode", choices=["caption-tar", "llava-json"], default="caption-tar",
+                    help="Stage 2a = caption-tar (jpg/txt shards); Stage 2b = llava-json (instruction)")
 parser.add_argument("--tar-dir", nargs="+", default=["data/cc3m"],
-                    help="One or more directories containing tar shards (*.tar)")
+                    help="[caption-tar] One or more directories containing tar shards (*.tar)")
+parser.add_argument("--jsonl-path", default=None,
+                    help="[llava-json] Path to LLaVA-Instruct JSONL")
+parser.add_argument("--image-root", default=None,
+                    help="[llava-json] Root dir the JSONL 'image' paths are relative to")
+parser.add_argument("--no-4bit", action="store_true",
+                    help="Load the LLM in bf16 instead of 4-bit NF4 (use when bitsandbytes "
+                         "is unavailable; fine on H200-class GPUs with LoRA)")
 parser.add_argument("--max-steps", type=int, default=10000)
 parser.add_argument("--batch-size", type=int, default=4,
                     help="Images per micro-batch (before grad accumulation)")
@@ -155,27 +166,39 @@ if tokenizer.pad_token is None:
 tokenizer.padding_side = "right"
 
 
-# -- load LLM in 4-bit NF4 + LoRA ----------------------------------------------
+# -- load LLM (4-bit NF4 by default, or bf16 with --no-4bit) --------------------
 print(f"\nLoading LLM: {args.llm_name}")
-print("  Quantization: 4-bit NF4 double-quant (bfloat16 compute)")
-bnb_config = BitsAndBytesConfig(
-    load_in_4bit=True,
-    bnb_4bit_quant_type="nf4",
-    bnb_4bit_compute_dtype=torch.bfloat16,
-    bnb_4bit_use_double_quant=True,
-)
-llm = AutoModelForCausalLM.from_pretrained(
-    args.llm_name,
-    quantization_config=bnb_config,
-    torch_dtype=torch.bfloat16,
-    device_map="auto",
-)
+if args.no_4bit:
+    print("  Precision: bf16 (no quantization) — LoRA on top")
+    llm = AutoModelForCausalLM.from_pretrained(
+        args.llm_name, torch_dtype=torch.bfloat16, device_map="auto",
+    )
+else:
+    print("  Quantization: 4-bit NF4 double-quant (bfloat16 compute)")
+    from transformers import BitsAndBytesConfig  # lazy: only when 4-bit requested
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.bfloat16,
+        bnb_4bit_use_double_quant=True,
+    )
+    llm = AutoModelForCausalLM.from_pretrained(
+        args.llm_name,
+        quantization_config=bnb_config,
+        torch_dtype=torch.bfloat16,
+        device_map="auto",
+    )
 # LLM hidden dim — read from config, NOT hardcoded. This is what makes the
 # script work with any HF causal LM without edits.
 llm_dim = llm.config.hidden_size
 print(f"  llm_dim (hidden_size) = {llm_dim}")
 
-llm = prepare_model_for_kbit_training(llm)
+if args.no_4bit:
+    for p in llm.parameters():
+        p.requires_grad_(False)  # freeze base; LoRA adds trainable adapters
+else:
+    from peft import prepare_model_for_kbit_training  # lazy: 4-bit path only
+    llm = prepare_model_for_kbit_training(llm)
 lora_cfg = LoraConfig(
     r=args.lora_r,
     lora_alpha=args.lora_alpha,
@@ -235,53 +258,15 @@ if args.resume:
         print("  No checkpoint found - starting from scratch")
 
 
-# -- CC3M data stream ----------------------------------------------------------
-def cc3m_stream(tar_dir):
-    """Infinite shuffled generator of (PIL.Image, caption) from tar directories."""
-    dirs = [tar_dir] if isinstance(tar_dir, str) else tar_dir
-    tar_files = []
-    for d in dirs:
-        found = sorted(glob.glob(os.path.join(d, "*.tar")))
-        tar_files.extend(found)
-        print(f"\nData: {len(found)} tar shards in {d}")
-    if not tar_files:
-        raise RuntimeError(f"No .tar files found in {dirs}")
-    print(f"  Total: {len(tar_files)} shards across {len(dirs)} director(ies)")
-    while True:
-        random.shuffle(tar_files)
-        for tar_path in tar_files:
-            try:
-                with tarfile.open(tar_path) as tar:
-                    members = {m.name: m for m in tar.getmembers()}
-                    stems = [n[:-4] for n in members if n.endswith(".jpg")]
-                    random.shuffle(stems)
-                    for stem in stems:
-                        jpg_key = stem + ".jpg"
-                        txt_key = stem + ".txt"
-                        if jpg_key not in members or txt_key not in members:
-                            continue
-                        try:
-                            img_bytes = tar.extractfile(members[jpg_key]).read()
-                            cap_bytes = tar.extractfile(members[txt_key]).read()
-                            img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-                            caption = cap_bytes.decode("utf-8", errors="replace").strip()
-                            if caption:
-                                yield img, caption
-                        except Exception:
-                            continue
-            except Exception as e:
-                print(f"  Warning: skipping {os.path.basename(tar_path)}: {e}")
-                continue
-
-
-def pull_batch(stream, n: int):
-    images, captions = [], []
-    for img, cap in stream:
-        images.append(img)
-        captions.append(cap)
-        if len(images) >= n:
-            break
-    return images, captions
+# -- data stream (caption-tar for 2a, llava-json for 2b) -----------------------
+# caption_tar_stream / llava_json_stream / pull_batch imported from
+# data.vlm_dataset (unit-tested separately).
+if args.data_mode == "caption-tar":
+    data_stream = caption_tar_stream(args.tar_dir)
+else:  # llava-json
+    if not args.jsonl_path or not args.image_root:
+        raise SystemExit("--data-mode llava-json requires --jsonl-path and --image-root")
+    data_stream = llava_json_stream(args.jsonl_path, args.image_root)
 
 
 # -- checkpoint save / rotate --------------------------------------------------
@@ -309,7 +294,6 @@ print(f"  Steps: {args.max_steps} | Micro-batch: {args.batch_size} | Grad-accum:
 print(f"  LR: {args.lr} | Warmup: {args.warmup_steps} | Token budget: {args.token_budget} | Image size: {args.image_size}")
 
 embed_fn = llm.get_input_embeddings()
-data_stream = cc3m_stream(args.tar_dir)
 log_path = output_dir / "training_log.jsonl"
 
 projector.train()
@@ -323,7 +307,7 @@ start_time = time.time()
 
 try:
     while step < args.max_steps:
-        images, captions = pull_batch(data_stream, args.batch_size)
+        images, targets = pull_batch(data_stream, args.batch_size)
         pixel_values = torch.stack([transform(img) for img in images]).to(
             device, dtype=torch.bfloat16
         )
@@ -334,18 +318,16 @@ try:
                 vis_out = vision(pixel_values, token_budget=args.token_budget)
 
             visual_embeds = projector(vis_out)  # (B, N_vis, llm_dim)
-
-            enc = tokenizer(
-                ["Caption: " + c for c in captions],
-                padding=True,
-                truncation=True,
-                max_length=args.max_caption_length,
-                return_tensors="pt",
-                add_special_tokens=True,
-            )
             embed_device = next(embed_fn.parameters()).device
-            input_ids = enc.input_ids.to(embed_device)
-            attn_mask = enc.attention_mask.to(embed_device)
+
+            # Text tokenization + label building. caption-tar: label = caption;
+            # llava-json: label = assistant turns only (masking done in module).
+            if args.data_mode == "caption-tar":
+                input_ids, attn_mask, text_labels = build_caption_batch(
+                    targets, tokenizer, args.max_caption_length, embed_device)
+            else:
+                input_ids, attn_mask, text_labels = build_llava_batch(
+                    targets, tokenizer, args.max_caption_length, embed_device)
 
             B, N_vis = visual_embeds.shape[:2]
 
@@ -359,8 +341,8 @@ try:
             vis_attn = torch.ones(B, N_vis, dtype=torch.long, device=embed_device)
             full_attn = torch.cat([vis_attn, attn_mask], dim=1)
 
-            text_labels = input_ids.clone()
-            text_labels[attn_mask == 0] = -100
+            # text_labels already has padding (2a) / user turns (2b) masked to
+            # -100 by the batch builder. Vision positions are never a target.
             vis_labels = torch.full((B, N_vis), -100, dtype=torch.long, device=embed_device)
             labels = torch.cat([vis_labels, text_labels], dim=1)
 

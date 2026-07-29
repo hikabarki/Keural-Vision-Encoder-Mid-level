@@ -41,24 +41,14 @@ Keural Mid is the second stage of the Keural Vision Encoder roadmap, scaling fro
 | Token budget | 256 | **512 (max 2048)** | 1024 (max 4096) |
 | Hardware | 1× RTX 5090 | **2× H200 141GB** | 64× H100 |
 | Text encoder | MiniLM-L6-v2 | **CLIP ViT-L/14** | CLIP ViT-L/14 |
-| Status | ✅ Complete | 🔄 Training | 📅 Planned |
+| Status | ✅ Complete | ✅ **Complete** (18K steps) | 📅 Planned |
 
 ---
 
 ## Architecture
 
-```mermaid
-flowchart TD
-    IMG["RGB Image · (B, 3, H, W)"] --> STEM["CNN Stem (4-stage strided conv)<br/>3 → 128 → 256 → 512 → 768 · GroupNorm · GELU · stride 16×"]
-    STEM --> SAL["Saliency Predictor<br/>Conv(768→192, k3) → GELU → Conv(192→1, k1) → σ<br/>per-position importance map ∈ (0,1)"]
-    STEM --> ATB["ATB Tokenizer<br/>Gumbel-Top-K + NMS · differentiable weighted pooling<br/>budget 512 (max 2048) · split 5% global / 25% region / 70% detail<br/>fixed-grid warmup → annealed Gumbel sampling"]
-    SAL --> ATB
-    ATB --> HCT["HCT — 3 semantic levels<br/>global(0) · region(1) · detail(2)<br/>learned level embeddings + per-level constructors"]
-    HCT --> TF["Spatial Transformer ×24<br/>RMSNorm · SwiGLU · continuous 2D-RoPE (cx, cy)<br/>8-bucket log-area scale bias · [POOL] token"]
-    TF --> OUT["KeuralEncoderOutput<br/>pooled (B,768) · tokens (B,N,768)<br/>level_ids · spatial_metadata · saliency_scores · attention_mask"]
-```
 
-> 🎬 **Animated versions:** the GIF above, or the [interactive diagram](https://huggingface.co/spaces/mkd-hika/keural-vision-encoder-diagram) (flowing tensors + compute sweep, pure SVG/JS).
+> The figure at the top of this README is the full specification: **(a)** tokenizer stack, **(b)** spatial transformer block and continuous 2D-RoPE, **(c)** output contract, dual-teacher distillation and training objective. An interactive version is available in [`assets/pipeline_diagram.html`](assets/pipeline_diagram.html) (self-contained SVG/JS — open in any browser).
 
 ### Output contract
 

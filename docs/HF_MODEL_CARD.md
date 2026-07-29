@@ -147,18 +147,8 @@ print(out.saliency_scores.shape)   # (1, 512)       per-token importance
 The figure above is the complete specification: **(a)** the tokenizer stack
 (CNN stem → saliency → ATB → HCT), **(b)** the spatial transformer block and
 continuous 2D-RoPE, **(c)** the output contract, dual-teacher distillation, and
-the training objective. A simplified flow:
+the training objective.
 
-```mermaid
-flowchart TD
-    IMG["RGB Image · (B,3,H,W)"] --> STEM["CNN Stem (4-stage)<br/>3 → 128 → 256 → 512 → 768 · stride 16×"]
-    STEM --> SAL["Saliency Predictor<br/>per-pixel importance map [0,1]"]
-    STEM --> ATB["ATB Tokenizer · Gumbel-Top-K + NMS<br/>weighted pooling · budget 512 (up to 2048)<br/>global 5% · region 25% · detail 70%"]
-    SAL --> ATB
-    ATB --> HCT["HCT levels<br/>global / region / detail + learned level embeddings"]
-    HCT --> TF["Spatial Transformer ×24<br/>RMSNorm · SwiGLU · continuous 2D-RoPE<br/>log-area scale bias (8 buckets) · [POOL] token"]
-    TF --> OUT["pooled (B,768) + tokens (B,N,768)<br/>+ level_ids + spatial_metadata + saliency_scores"]
-```
 
 The `pooled` image embedding is the `[POOL]` token after the final RMSNorm (no separate projection head). For contrastive training it is aligned against a trainable projection of a frozen CLIP text encoder.
 

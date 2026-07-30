@@ -62,7 +62,10 @@ parser.add_argument("--projector-ckpt", required=True,
 parser.add_argument("--lora-ckpt", default=None,
                     help="LoRA adapter dir from Stage 2 (omit to use the base LLM)")
 parser.add_argument("--llm-name", default="Qwen/Qwen2.5-7B-Instruct")
-parser.add_argument("--image", required=True)
+parser.add_argument("--image", default=None, help="Single image file")
+parser.add_argument("--image-dir", default=None,
+                    help="Run every image in this directory through the same "
+                         "question on ONE model load (see test_images/)")
 parser.add_argument("--question", default="Describe this image in detail.")
 parser.add_argument("--chat", action="store_true",
                     help="Interactive loop: keep asking about the same image")
@@ -179,6 +182,28 @@ def answer(pil_img: Image.Image, question: str) -> str:
     # With inputs_embeds, generate() returns ONLY the new tokens.
     return tokenizer.decode(out[0], skip_special_tokens=True).strip()
 
+
+if args.image_dir:
+    exts = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
+    paths = sorted(p for p in Path(args.image_dir).iterdir()
+                   if p.suffix.lower() in exts)
+    if not paths:
+        raise SystemExit(f"ERROR: no images found in {args.image_dir}")
+    print(f"\nBatch: {len(paths)} images from {args.image_dir}")
+    print(f"Q: {args.question}\n" + "=" * 70)
+    for p in paths:
+        try:
+            im = Image.open(p).convert("RGB")
+        except Exception as e:
+            print(f"{p.name}: SKIPPED ({e})")
+            continue
+        print(f"\n[{p.name}]  ({im.size[0]}x{im.size[1]})")
+        print(f"  -> {answer(im, args.question)}")
+    print("\n" + "=" * 70)
+    raise SystemExit(0)
+
+if not args.image:
+    raise SystemExit("ERROR: pass --image <file> or --image-dir <folder>")
 
 img = Image.open(args.image).convert("RGB")
 print(f"\nImage: {args.image}  ({img.size[0]}x{img.size[1]})")

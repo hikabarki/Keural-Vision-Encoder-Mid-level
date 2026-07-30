@@ -41,3 +41,6 @@ docs/reports/
 # Reference copies of other projects (keep out of this repo)
 VISION-ENCODER_tiny-main/
 tiny-reference/
+
+# Local VLM test images (COCO-derived, not redistributed)
+test_images/*.jpg

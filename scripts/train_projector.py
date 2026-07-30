@@ -59,8 +59,10 @@ from peft import LoraConfig, get_peft_model
 from alignment.projectors import LevelAwareProjector
 from data.vlm_dataset import (
     caption_tar_stream, llava_json_stream, pull_batch,
-    build_caption_batch, build_llava_batch,
+    build_caption_batch, build_llava_batch, _normalize_conversation,
+    PrefetchLoader,
 )
+from PIL import Image
 
 
 # -- args ----------------------------------------------------------------------
@@ -91,6 +93,13 @@ parser.add_argument("--warmup-steps", type=int, default=500)
 parser.add_argument("--weight-decay", type=float, default=0.05)
 parser.add_argument("--save-every", type=int, default=1000)
 parser.add_argument("--log-every", type=int, default=10)
+parser.add_argument("--val-jsonl", nargs="+", default=None,
+                    help="Held-out JSONL(s) for periodic validation loss. Pass as\n                         lang:path pairs (e.g. en:/path/en_val.jsonl ko:/path/ko_val.jsonl)\n                         to get per-language numbers.")
+parser.add_argument("--val-image-root", default=None, help="Image root for --val-jsonl")
+parser.add_argument("--val-every", type=int, default=250, help="Run validation every N steps")
+parser.add_argument("--val-samples", type=int, default=64, help="Records per validation pass")
+parser.add_argument("--loader-workers", type=int, default=16,
+                    help="Threads for image read+decode. The datasets live on NFS, so the\n                         naive serial path leaves the GPU I/O-starved.")
 parser.add_argument("--token-budget", type=int, default=512,
                     help="Vision token budget passed to the encoder (Mid default 512)")
 parser.add_argument("--image-size", type=int, default=384,
@@ -107,8 +116,31 @@ parser.add_argument("--resume", action="store_true",
                     help="Resume from latest checkpoint in --output-dir")
 args = parser.parse_args()
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Device: {device}")
+# -- distributed (DDP) setup ---------------------------------------------------
+# device_map="auto" splits the LLM ACROSS GPUs (pipeline parallel), so only one
+# card computes at a time — measured at ~30-55% utilisation each. Under DDP each
+# rank holds a FULL model copy and they train simultaneously on disjoint data.
+import torch.distributed as dist
+LOCAL_RANK = int(os.environ.get("LOCAL_RANK", -1))
+DDP = LOCAL_RANK != -1
+if DDP:
+    dist.init_process_group(backend="nccl")
+    torch.cuda.set_device(LOCAL_RANK)
+    RANK, WORLD = dist.get_rank(), dist.get_world_size()
+    device = torch.device(f"cuda:{LOCAL_RANK}")
+else:
+    RANK, WORLD = 0, 1
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+IS_MAIN = RANK == 0
+
+
+def rprint(*a, **k):
+    """Print on rank 0 only — otherwise every log line is duplicated per GPU."""
+    if IS_MAIN:
+        print(*a, **k)
+
+
+rprint(f"Device: {device} | DDP: {DDP} (rank {RANK}/{WORLD})")
 if device.type != "cuda":
     print("WARNING: training on CPU will be extremely slow. Use CUDA for Stage 2.")
 
@@ -171,7 +203,8 @@ print(f"\nLoading LLM: {args.llm_name}")
 if args.no_4bit:
     print("  Precision: bf16 (no quantization) — LoRA on top")
     llm = AutoModelForCausalLM.from_pretrained(
-        args.llm_name, torch_dtype=torch.bfloat16, device_map="auto",
+        args.llm_name, torch_dtype=torch.bfloat16,
+        device_map={"": LOCAL_RANK} if DDP else "auto",
     )
 else:
     print("  Quantization: 4-bit NF4 double-quant (bfloat16 compute)")
@@ -186,7 +219,7 @@ else:
         args.llm_name,
         quantization_config=bnb_config,
         torch_dtype=torch.bfloat16,
-        device_map="auto",
+        device_map={"": LOCAL_RANK} if DDP else "auto",
     )
 # LLM hidden dim — read from config, NOT hardcoded. This is what makes the
 # script work with any HF causal LM without edits.
@@ -225,6 +258,21 @@ print(f"  {n_proj:,} params ({n_proj/1e6:.1f}M) - all trainable")
 # -- optimizer over projector + LoRA params ------------------------------------
 lora_params = [p for p in llm.parameters() if p.requires_grad]
 all_trainable = list(projector.parameters()) + lora_params
+
+# -- DDP wrapping --------------------------------------------------------------
+# Two trainable groups need gradient all-reduce: the projector and the LoRA
+# adapters inside the LLM. find_unused_parameters=True is required on the LLM
+# because LoRA only touches a subset of modules, so many params legitimately
+# receive no gradient and DDP would otherwise error.
+# projector_module / llm_module are the UNWRAPPED handles, used for saving and
+# for validation (calling .module avoids DDP's forward-hook bookkeeping).
+projector_module, llm_module = projector, llm
+if DDP:
+    from torch.nn.parallel import DistributedDataParallel as DDPWrap
+    projector = DDPWrap(projector, device_ids=[LOCAL_RANK], output_device=LOCAL_RANK)
+    llm = DDPWrap(llm, device_ids=[LOCAL_RANK], output_device=LOCAL_RANK,
+                  find_unused_parameters=True)
+    rprint(f"  DDP: projector + LoRA wrapped across {WORLD} ranks")
 optimizer = torch.optim.AdamW(
     all_trainable,
     lr=args.lr,
@@ -266,15 +314,18 @@ if args.data_mode == "caption-tar":
 else:  # llava-json
     if not args.jsonl_path or not args.image_root:
         raise SystemExit("--data-mode llava-json requires --jsonl-path and --image-root")
-    data_stream = llava_json_stream(args.jsonl_path, args.image_root)
+    data_stream = llava_json_stream(args.jsonl_path, args.image_root, yield_path=True,
+                                    rank=RANK, world_size=WORLD)
 
 
 # -- checkpoint save / rotate --------------------------------------------------
 def save_checkpoint(step: int) -> None:
+    if not IS_MAIN:
+        return  # rank 0 owns checkpointing; other ranks hold identical weights
     ckpt_dir = output_dir / f"checkpoint-{step}"
     ckpt_dir.mkdir(exist_ok=True)
-    torch.save(projector.state_dict(), ckpt_dir / "projector.pt")
-    llm.save_pretrained(ckpt_dir / "lora_adapter")
+    torch.save(projector_module.state_dict(), ckpt_dir / "projector.pt")
+    llm_module.save_pretrained(ckpt_dir / "lora_adapter")
     torch.save({"step": step, "optimizer": optimizer.state_dict(),
                 "encoder_dim": encoder_dim, "llm_dim": llm_dim,
                 "llm_name": args.llm_name},
@@ -288,12 +339,74 @@ def save_checkpoint(step: int) -> None:
 
 
 # -- training loop -------------------------------------------------------------
-eff_batch = args.batch_size * args.grad_accum
-print(f"\nStarting training:")
-print(f"  Steps: {args.max_steps} | Micro-batch: {args.batch_size} | Grad-accum: {args.grad_accum} | Eff-batch: {eff_batch}")
-print(f"  LR: {args.lr} | Warmup: {args.warmup_steps} | Token budget: {args.token_budget} | Image size: {args.image_size}")
+eff_batch = args.batch_size * args.grad_accum * WORLD
+rprint(f"\nStarting training:")
+rprint(f"  Steps: {args.max_steps} | Micro-batch: {args.batch_size} | Grad-accum: {args.grad_accum} | Eff-batch: {eff_batch}")
+rprint(f"  LR: {args.lr} | Warmup: {args.warmup_steps} | Token budget: {args.token_budget} | Image size: {args.image_size}")
 
-embed_fn = llm.get_input_embeddings()
+embed_fn = llm_module.get_input_embeddings()
+
+# Threaded prefetch: overlaps NFS image reads/decode with GPU compute.
+loader = PrefetchLoader(data_stream, args.batch_size, transform,
+                        workers=args.loader_workers,
+                        from_paths=(args.data_mode == 'llava-json'))
+rprint(f'[data] prefetch: {args.loader_workers} loader threads')
+
+# -- held-out validation sets -------------------------------------------------
+# Periodic teacher-forced loss on data the model never trains on. Without this
+# the only signal is training loss, which cannot distinguish learning from
+# memorisation. Reported per language so Korean quality is visible separately
+# (no public Korean VLM benchmark exists to check it against).
+val_sets = {}
+if args.val_jsonl:
+    for spec in args.val_jsonl:
+        lang, _, path = spec.partition(":")
+        if not path:
+            lang, path = "val", spec
+        recs = [json.loads(l) for l in open(path)][: args.val_samples]
+        val_sets[lang] = recs
+        print(f"[val] {lang}: {len(recs)} held-out records from {path}")
+
+
+@torch.no_grad()
+def run_validation():
+    """Teacher-forced loss on the held-out sets. Returns {lang: (loss, ppl)}."""
+    was_training = projector_module.training
+    projector_module.eval(); llm_module.eval()
+    out = {}
+    for lang, recs in val_sets.items():
+        tot_loss, tot_tok = 0.0, 0
+        for r in recs:
+            msgs = _normalize_conversation(r)
+            img_p = Path(args.val_image_root) / r["image"]
+            if not msgs or not img_p.exists():
+                continue
+            try:
+                pv = transform(Image.open(img_p).convert("RGB")).unsqueeze(0).to(
+                    device, dtype=torch.bfloat16)
+            except Exception:
+                continue
+            with torch.autocast(device_type=device.type, dtype=torch.bfloat16,
+                                enabled=(device.type == "cuda")):
+                vis = projector_module(vision(pv, token_budget=args.token_budget))
+                ed = next(embed_fn.parameters()).device
+                ids, attn, labels = build_llava_batch(
+                    [msgs], tokenizer, args.max_caption_length, ed)
+                inp = torch.cat([vis.to(ed), embed_fn(ids).to(torch.bfloat16)], dim=1)
+                full_attn = torch.cat(
+                    [torch.ones(vis.shape[:2], dtype=torch.long, device=ed), attn], dim=1)
+                vis_lab = torch.full(vis.shape[:2], -100, dtype=torch.long, device=ed)
+                o = llm_module(inputs_embeds=inp, attention_mask=full_attn,
+                               labels=torch.cat([vis_lab, labels], dim=1))
+            ntok = int((labels != -100).sum())
+            if ntok:
+                tot_loss += o.loss.item() * ntok; tot_tok += ntok
+        if tot_tok:
+            L = tot_loss / tot_tok
+            out[lang] = (L, float(torch.exp(torch.tensor(L))))
+    if was_training:
+        projector_module.train(); llm_module.train()
+    return out
 log_path = output_dir / "training_log.jsonl"
 
 projector.train()
@@ -307,10 +420,8 @@ start_time = time.time()
 
 try:
     while step < args.max_steps:
-        images, targets = pull_batch(data_stream, args.batch_size)
-        pixel_values = torch.stack([transform(img) for img in images]).to(
-            device, dtype=torch.bfloat16
-        )
+        pixel_values, targets = next(loader)
+        pixel_values = pixel_values.to(device, dtype=torch.bfloat16, non_blocking=True)
 
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16,
                             enabled=(device.type == "cuda")):
@@ -353,7 +464,14 @@ try:
             )
             loss = outputs.loss / args.grad_accum
 
-        loss.backward()
+        # Under DDP, all-reduce only on the FINAL micro-step of the accumulation
+        # window; syncing every micro-step wastes interconnect bandwidth.
+        is_last_micro = (accum_count + 1) >= args.grad_accum
+        if DDP and not is_last_micro:
+            with projector.no_sync(), llm.no_sync():
+                loss.backward()
+        else:
+            loss.backward()
         accum_loss += loss.item()
         accum_count += 1
 
@@ -379,14 +497,29 @@ try:
                     f"ETA={eta_h}h{eta_m:02d}m  lr={current_lr:.2e}  "
                     f"loss={accum_loss:.4f}  grad_norm={float(grad_norm):.2e}"
                 )
-                print(line)
-                with log_path.open("a") as f:
-                    f.write(json.dumps({
-                        "step": step, "loss": accum_loss,
-                        "lr": current_lr, "grad_norm": float(grad_norm),
-                    }) + "\n")
+                rprint(line)
+                if IS_MAIN:
+                    with log_path.open("a") as f:
+                        f.write(json.dumps({
+                            "step": step, "loss": accum_loss,
+                            "lr": current_lr, "grad_norm": float(grad_norm),
+                        }) + "\n")
 
             accum_loss = 0.0
+
+            # -- periodic held-out validation --------------------------------
+            if IS_MAIN and val_sets and step > 0 and step % args.val_every == 0:
+                vres = run_validation()
+                if vres:
+                    parts = " | ".join(
+                        f"{lang} loss={L:.4f} ppl={ppl:.2f}" for lang, (L, ppl) in vres.items())
+                    rprint(f"[val]   step={step:5d}  {parts}", flush=True)
+                    with log_path.open("a") as f:
+                        f.write(json.dumps({
+                            "step": step, "type": "val",
+                            **{f"val_{lang}_loss": L for lang, (L, _) in vres.items()},
+                            **{f"val_{lang}_ppl": ppl for lang, (_, ppl) in vres.items()},
+                        }) + "\n")
 
             if step > 0 and step % args.save_every == 0:
                 save_checkpoint(step)
@@ -399,8 +532,13 @@ except KeyboardInterrupt:
     print("[train] Checkpoint saved. Exiting.")
     sys.exit(0)
 
-print(f"\n[train] Training complete - {step} steps")
+rprint(f"\n[train] Training complete - {step} steps")
 save_checkpoint(step)
 print(f"\nCheckpoints saved to: {output_dir}")
 print(f"  projector weights:  checkpoint-{step}/projector.pt")
 print(f"  LoRA adapter:       checkpoint-{step}/lora_adapter/")
+
+
+if DDP:
+    dist.barrier()
+    dist.destroy_process_group()

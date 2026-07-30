@@ -111,7 +111,8 @@ def _resolve_image_path(record, image_root):
     return p if p.exists() else None
 
 
-def llava_json_stream(jsonl_path, image_root, skip_missing=True):
+def llava_json_stream(jsonl_path, image_root, skip_missing=True, yield_path=False,
+                      rank=0, world_size=1):
     """Infinite shuffled generator of (PIL.Image, messages) from a LLaVA JSONL.
 
     Records missing an image (or whose image file is absent on disk) are
@@ -127,11 +128,21 @@ def llava_json_stream(jsonl_path, image_root, skip_missing=True):
                     records.append(json.loads(line))
                 except json.JSONDecodeError:
                     continue
-    print(f"[data] llava: {len(records)} records in {jsonl_path}")
+    # Partition across DDP ranks so each GPU sees a DISJOINT slice. Without
+    # this every rank would iterate the same records and the effective dataset
+    # would be the same size while claiming world_size x throughput.
+    if world_size > 1:
+        total = len(records)
+        records = records[rank::world_size]
+        print(f"[data] llava: rank {rank}/{world_size} got {len(records)} of "
+              f"{total} records from {jsonl_path}")
+    else:
+        print(f"[data] llava: {len(records)} records in {jsonl_path}")
 
     missing = 0
+    rng = random.Random(1234 + rank)
     while True:
-        random.shuffle(records)
+        rng.shuffle(records)
         for rec in records:
             msgs = _normalize_conversation(rec)
             if not msgs or msgs[-1]["role"] != "assistant":
@@ -144,6 +155,11 @@ def llava_json_stream(jsonl_path, image_root, skip_missing=True):
                         print(f"[data] WARNING: {missing} records skipped (image missing)")
                     continue
                 raise FileNotFoundError(f"Image not found for record: {rec.get('image')}")
+            if yield_path:
+                # Defer the read so PrefetchLoader's worker pool does it —
+                # opening here would serialise every NFS read on this thread.
+                yield img_path, msgs
+                continue
             try:
                 img = Image.open(img_path).convert("RGB")
             except Exception:
@@ -160,6 +176,73 @@ def pull_batch(stream, n):
         if len(imgs) >= n:
             break
     return imgs, targets
+
+
+class PrefetchLoader:
+    """Background-threaded batch loader.
+
+    The naive path (pull_batch in the training loop) opens and decodes images
+    one at a time, synchronously, on the main thread. With the datasets on NFS
+    that leaves the GPU idle waiting on network reads — measured at ~33-57%
+    utilisation, i.e. I/O-bound rather than compute-bound.
+
+    This runs image reading + decoding + the torchvision transform in a pool of
+    worker threads (the GIL is released during file I/O and in PIL/torch native
+    code, so threads genuinely overlap here) and keeps a bounded queue of ready
+    batches so the GPU always has work waiting.
+
+    Yields (pixel_values_tensor, targets) instead of raw PIL images, since the
+    transform is done in the workers too.
+    """
+
+    def __init__(self, stream, batch_size, transform, queue_depth=4, workers=16,
+                 from_paths=True):
+        import queue, threading
+        self.stream = stream
+        self.batch_size = batch_size
+        self.transform = transform
+        self.workers = workers
+        self.from_paths = from_paths
+        self.q = queue.Queue(maxsize=queue_depth)
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._produce, daemon=True)
+        self._thread.start()
+
+    def _produce(self):
+        from concurrent.futures import ThreadPoolExecutor
+        import torch
+        with ThreadPoolExecutor(max_workers=self.workers) as pool:
+            while not self._stop.is_set():
+                imgs, targets = pull_batch(self.stream, self.batch_size)
+                if not imgs:
+                    break
+                try:
+                    tensors = list(pool.map(self._load_one, imgs))
+                    keep = [(x, tg) for x, tg in zip(tensors, targets) if x is not None]
+                    if not keep:
+                        continue
+                    batch = torch.stack([x for x, _ in keep])
+                    targets = [tg for _, tg in keep]
+                except Exception:
+                    continue  # skip a malformed batch rather than kill training
+                self.q.put((batch, targets))
+
+    def _load_one(self, item):
+        """Open (if given a path) + transform. Runs in a worker thread."""
+        try:
+            img = Image.open(item).convert("RGB") if self.from_paths else item
+            return self.transform(img)
+        except Exception:
+            return None
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return self.q.get()
+
+    def stop(self):
+        self._stop.set()
 
 
 # ---------------------------------------------------------------------------

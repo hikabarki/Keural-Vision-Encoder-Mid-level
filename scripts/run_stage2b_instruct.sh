@@ -37,9 +37,12 @@ fi
 
 source venv_mid/bin/activate 2>/dev/null
 
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
 # Lower LR than 2a: the projector is already aligned, and LoRA is now learning
 # instruction-following on top. Higher LR here tends to wreck 2a's alignment.
-nohup python3 scripts/train_projector.py \
+nohup torchrun --nproc_per_node=2 --master_port=29517 \
+  scripts/train_projector.py \
   --vision-ckpt outputs/run/final \
   --llm-name Qwen/Qwen2.5-7B-Instruct \
   --no-4bit \
@@ -49,14 +52,19 @@ nohup python3 scripts/train_projector.py \
   --output-dir "$OUT" \
   --token-budget 512 \
   --image-size 512 \
-  --batch-size 8 \
-  --grad-accum 4 \
+  --batch-size 12 \
+  --grad-accum 2 \
   --lr 2e-5 \
   --warmup-steps 200 \
   --max-steps 8000 \
   --max-caption-length 512 \
   --save-every 1000 \
   --log-every 10 \
+  --val-jsonl "en:$DATA/llava-instruct/train_150k_val.jsonl" \
+  --val-image-root "$DATA/coco/train2017" \
+  --val-every 250 \
+  --val-samples 64 \
+  --loader-workers 32 \
   > outputs/stage2b.log 2>&1 &
 
 echo "Stage 2b launched (pid $!). Follow with:"

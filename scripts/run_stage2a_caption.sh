@@ -23,13 +23,17 @@ fi
 
 source venv_mid/bin/activate 2>/dev/null
 
+# At ~86% VRAM the default allocator can OOM on fragmentation alone.
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
 # NOTE: --no-4bit uses bf16 + LoRA. bitsandbytes 4-bit is broken in this env
 # (CUDA binary mismatch) and unnecessary on H200s for a 7B model.
 #
 # LLaVA-Pretrain ships as JSON + loose JPEGs (NOT WebDataset tar shards), and
 # its records use the same {image, conversations} schema as LLaVA-Instruct —
 # so it goes through llava-json mode, not caption-tar.
-nohup python3 scripts/train_projector.py \
+nohup torchrun --nproc_per_node=2 --master_port=29517 \
+  scripts/train_projector.py \
   --vision-ckpt outputs/run/final \
   --llm-name Qwen/Qwen2.5-7B-Instruct \
   --no-4bit \
@@ -46,6 +50,11 @@ nohup python3 scripts/train_projector.py \
   --max-steps 5000 \
   --save-every 1000 \
   --log-every 10 \
+  --val-jsonl "en:$DATA/llava-pretrain/pretrain_558k_val.jsonl" \
+  --val-image-root "$DATA/llava-pretrain/images" \
+  --val-every 250 \
+  --val-samples 64 \
+  --loader-workers 32 \
   > outputs/stage2a.log 2>&1 &
 
 echo "Stage 2a launched (pid $!). Follow with:"

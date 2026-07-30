@@ -52,8 +52,8 @@ nohup torchrun --nproc_per_node=2 --master_port=29517 \
   --output-dir "$OUT" \
   --token-budget 512 \
   --image-size 512 \
-  --batch-size 12 \
-  --grad-accum 2 \
+  --batch-size 8 \
+  --grad-accum 4 \
   --lr 2e-5 \
   --warmup-steps 200 \
   --max-steps 8000 \

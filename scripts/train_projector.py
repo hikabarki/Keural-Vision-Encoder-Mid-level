@@ -352,16 +352,40 @@ def load_trained_weights(ckpt: Path) -> None:
         raise SystemExit(
             f"ERROR: no adapter weights in {adapter_dir}. Continuing without "
             "them would discard the trained LoRA.")
-    from peft import set_peft_model_state_dict
     if adapter_file.suffix == ".safetensors":
         from safetensors.torch import load_file
         lora_sd = load_file(str(adapter_file))
     else:
         lora_sd = torch.load(adapter_file, map_location="cpu")
-    incompat = set_peft_model_state_dict(llm_module, lora_sd)
-    unexpected = getattr(incompat, "unexpected_keys", None)
-    print(f"  LoRA adapter loaded ({len(lora_sd)} tensors)"
-          + (f" - unexpected keys: {unexpected}" if unexpected else ""))
+
+    # peft's set_peft_model_state_dict() is unusable in this environment: peft
+    # 0.19.1 unconditionally calls _maybe_shard_state_dict_for_tp(), which does
+    #   from transformers.integrations.tensor_parallel import EmbeddingParallel
+    # and that symbol does not exist in transformers 4.57.6 -> ImportError.
+    #
+    # Do the remap ourselves. save_pretrained() writes "...lora_A.weight", while
+    # the live model names the same parameter "...lora_A.<adapter_name>.weight".
+    adapter_name = "default"
+    remapped = {}
+    for k, v in lora_sd.items():
+        for tag in ("lora_A.", "lora_B.", "lora_embedding_A.", "lora_embedding_B."):
+            if tag in k:
+                k = k.replace(tag, f"{tag}{adapter_name}.")
+                break
+        remapped[k] = v
+
+    model_keys = set(llm_module.state_dict().keys())
+    matched = {k: v for k, v in remapped.items() if k in model_keys}
+    if len(matched) != len(remapped):
+        sample = sorted(set(remapped) - model_keys)[:3]
+        raise SystemExit(
+            f"ERROR: {len(remapped) - len(matched)}/{len(remapped)} LoRA tensors "
+            f"did not match model parameters, e.g. {sample}. Refusing to "
+            "continue with a partially loaded adapter.")
+    # strict=False because `matched` intentionally covers only LoRA params;
+    # every base-model weight is legitimately absent from it.
+    llm_module.load_state_dict(matched, strict=False)
+    print(f"  LoRA adapter loaded ({len(matched)} tensors)")
 
 
 # -- warm start (Stage 2b picks up where Stage 2a left off) --------------------

@@ -283,11 +283,27 @@ print(f"\nOptimizer: AdamW, lr={args.lr}, wd={args.weight_decay}")
 print(f"  Trainable params: {sum(p.numel() for p in all_trainable):,}")
 
 
+# -- checkpoint discovery ------------------------------------------------------
+def numbered_checkpoints(d: Path):
+    """checkpoint-<int> dirs, ascending. Anything with a non-numeric suffix
+    (checkpoint-1000.bak, a manual copy) is IGNORED rather than crashing
+    int() — a stray directory used to take down checkpoint rotation, and
+    therefore the whole run, at the first save."""
+    out = []
+    for p in d.glob("checkpoint-*"):
+        if not p.is_dir():
+            continue
+        try:
+            out.append((int(p.name.split("-")[-1]), p))
+        except ValueError:
+            print(f"[ckpt] ignoring non-numeric checkpoint dir: {p.name}")
+    return [p for _, p in sorted(out)]
+
+
 # -- resume from checkpoint ----------------------------------------------------
 start_step = 0
 if args.resume:
-    ckpts = sorted(output_dir.glob("checkpoint-[0-9]*"),
-                   key=lambda p: int(p.name.split("-")[-1]))
+    ckpts = numbered_checkpoints(output_dir)
     if ckpts:
         latest = ckpts[-1]
         resume_step = int(latest.name.split("-")[-1])
@@ -295,13 +311,48 @@ if args.resume:
         proj_path = latest / "projector.pt"
         state_path = latest / "training_state.pt"
         if proj_path.exists():
-            projector.load_state_dict(torch.load(proj_path, map_location=device))
+            # Load into the UNWRAPPED module: under DDP `projector` is a
+            # DistributedDataParallel whose keys are all "module."-prefixed,
+            # so loading the saved (unprefixed) state_dict into it raises a
+            # missing/unexpected-key RuntimeError.
+            projector_module.load_state_dict(
+                torch.load(proj_path, map_location=device))
             print("  Projector weights loaded")
+        else:
+            raise SystemExit(f"ERROR: {proj_path} missing - cannot resume")
+
+        # LoRA adapters are ~5M of the ~14M trainable params. Without this they
+        # silently reinitialise and the resumed run throws away half its
+        # learned weights while the loss curve looks merely "a bit worse".
+        adapter_dir = latest / "lora_adapter"
+        adapter_file = next(
+            (adapter_dir / n for n in ("adapter_model.safetensors",
+                                       "adapter_model.bin")
+             if (adapter_dir / n).exists()), None)
+        if adapter_file is None:
+            raise SystemExit(
+                f"ERROR: no adapter weights in {adapter_dir} - cannot resume. "
+                "Resuming without them would discard the trained LoRA.")
+        from peft import set_peft_model_state_dict
+        if adapter_file.suffix == ".safetensors":
+            from safetensors.torch import load_file
+            lora_sd = load_file(str(adapter_file))
+        else:
+            lora_sd = torch.load(adapter_file, map_location="cpu")
+        incompat = set_peft_model_state_dict(llm_module, lora_sd)
+        missing = getattr(incompat, "unexpected_keys", None)
+        print(f"  LoRA adapter loaded ({len(lora_sd)} tensors)"
+              + (f" - unexpected keys: {missing}" if missing else ""))
+
         if state_path.exists():
             state = torch.load(state_path, map_location="cpu")
             optimizer.load_state_dict(state["optimizer"])
             start_step = state["step"] + 1
             print(f"  Optimizer state loaded. Resuming at step {start_step}")
+        else:
+            raise SystemExit(
+                f"ERROR: {state_path} missing - refusing to resume without "
+                "optimizer state (Adam moments would restart cold).")
     else:
         print("  No checkpoint found - starting from scratch")
 
@@ -331,9 +382,7 @@ def save_checkpoint(step: int) -> None:
                 "llm_name": args.llm_name},
                ckpt_dir / "training_state.pt")
     print(f"[train] Saved checkpoint-{step} to {ckpt_dir}")
-    all_ckpts = sorted(output_dir.glob("checkpoint-[0-9]*"),
-                       key=lambda p: int(p.name.split("-")[-1]))
-    for old in all_ckpts[:-3]:
+    for old in numbered_checkpoints(output_dir)[:-3]:
         shutil.rmtree(old, ignore_errors=True)
         print(f"[train] Removed old checkpoint {old.name}")
 

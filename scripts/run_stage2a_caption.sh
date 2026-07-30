@@ -23,6 +23,15 @@ fi
 
 source venv_mid/bin/activate 2>/dev/null
 
+# Archive any previous log instead of truncating it. A run that dies (OOM kill,
+# SIGKILL) leaves its only diagnostic evidence here, and the next launch used to
+# overwrite it before anyone had read it.
+if [ -s outputs/stage2a.log ]; then
+  ARCHIVE="outputs/stage2a_$(date +%Y%m%d_%H%M%S).log"
+  mv outputs/stage2a.log "$ARCHIVE"
+  echo "Previous log archived -> $ARCHIVE"
+fi
+
 # At ~86% VRAM the default allocator can OOM on fragmentation alone.
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
@@ -45,8 +54,9 @@ nohup torchrun --nproc_per_node=2 --master_port=29517 \
   --image-size 512 \
   --batch-size 16 \
   --grad-accum 2 \
-  --lr 1e-3 \
-  --warmup-steps 200 \
+  --seed 42 \
+  --lr 5e-4 \
+  --warmup-steps 500 \
   --max-steps 5000 \
   --save-every 1000 \
   --log-every 10 \

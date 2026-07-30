@@ -90,6 +90,9 @@ parser.add_argument("--grad-accum", type=int, default=8,
                     help="Gradient accumulation steps (effective batch = batch_size x grad_accum)")
 parser.add_argument("--lr", type=float, default=1e-4)
 parser.add_argument("--warmup-steps", type=int, default=500)
+parser.add_argument("--seed", type=int, default=42,
+                    help="Seeds projector + LoRA init. Same on every rank; "
+                         "data order is seeded per-rank in vlm_dataset.")
 parser.add_argument("--weight-decay", type=float, default=0.05)
 parser.add_argument("--save-every", type=int, default=1000)
 parser.add_argument("--log-every", type=int, default=10)
@@ -143,6 +146,22 @@ def rprint(*a, **k):
 rprint(f"Device: {device} | DDP: {DDP} (rank {RANK}/{WORLD})")
 if device.type != "cuda":
     print("WARNING: training on CPU will be extremely slow. Use CUDA for Stage 2.")
+
+# -- seeding -------------------------------------------------------------------
+# Projector and LoRA weights are freshly initialised every launch. Without a
+# fixed seed that init is different each run, so whether training survives the
+# peak-LR phase is luck: the 2026-07-30 runs saw one init reach val ppl 23.9 by
+# step 750 while another blew up to 124.5 on IDENTICAL data and hyperparameters.
+# Seeding makes runs comparable and failures reproducible.
+#
+# The SAME seed on every rank is intentional: ranks must start from identical
+# weights (DDP broadcasts rank 0's parameters at construction, so a mismatch
+# would be silently overwritten rather than error). Data order is seeded
+# separately per rank in vlm_dataset (1234 + rank) so ranks see disjoint shards.
+random.seed(args.seed)
+torch.manual_seed(args.seed)
+torch.cuda.manual_seed_all(args.seed)
+rprint(f"Seed: {args.seed} (all ranks; data order seeded per-rank separately)")
 
 output_dir = Path(args.output_dir)
 output_dir.mkdir(parents=True, exist_ok=True)

@@ -44,6 +44,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 nohup torchrun --nproc_per_node=2 --master_port=29517 \
   scripts/train_projector.py \
   --vision-ckpt outputs/run/final \
+  --init-from "${INIT_FROM:-outputs/projector_2a/checkpoint-5000}" \
   --llm-name Qwen/Qwen2.5-7B-Instruct \
   --no-4bit \
   --data-mode llava-json \

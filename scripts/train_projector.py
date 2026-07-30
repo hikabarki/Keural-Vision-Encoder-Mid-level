@@ -115,6 +115,13 @@ parser.add_argument("--lora-r", type=int, default=16)
 parser.add_argument("--lora-alpha", type=int, default=32)
 parser.add_argument("--lora-targets", nargs="+", default=["q_proj", "v_proj"],
                     help="LoRA target module names in the LLM")
+parser.add_argument("--init-from", default=None, metavar="CKPT_DIR",
+                    help="Warm-start projector + LoRA weights from another "
+                         "stage's checkpoint dir (e.g. Stage 2a's "
+                         "checkpoint-5000), with a FRESH optimizer and LR "
+                         "schedule. Required for Stage 2b -- --resume only "
+                         "looks inside --output-dir, so 2b would otherwise "
+                         "start from random weights.")
 parser.add_argument("--resume", action="store_true",
                     help="Resume from latest checkpoint in --output-dir")
 args = parser.parse_args()
@@ -319,59 +326,75 @@ def numbered_checkpoints(d: Path):
     return [p for _, p in sorted(out)]
 
 
+# -- weight loading ------------------------------------------------------------
+def load_trained_weights(ckpt: Path) -> None:
+    """Load projector + LoRA weights from a checkpoint dir. Does NOT touch the
+    optimizer or the step counter — shared by --resume (which restores those
+    separately) and --init-from (which deliberately starts a fresh schedule)."""
+    proj_path = ckpt / "projector.pt"
+    if not proj_path.exists():
+        raise SystemExit(f"ERROR: {proj_path} missing")
+    # Load into the UNWRAPPED module: under DDP `projector` is a
+    # DistributedDataParallel whose keys are all "module."-prefixed, so loading
+    # the saved (unprefixed) state_dict into it raises a key-mismatch error.
+    projector_module.load_state_dict(torch.load(proj_path, map_location=device))
+    print("  Projector weights loaded")
+
+    # LoRA adapters are ~5M of the ~14M trainable params. Skipping them silently
+    # reinitialises a third of the learned weights while the loss curve looks
+    # merely "a bit worse" rather than obviously broken.
+    adapter_dir = ckpt / "lora_adapter"
+    adapter_file = next(
+        (adapter_dir / n for n in ("adapter_model.safetensors",
+                                   "adapter_model.bin")
+         if (adapter_dir / n).exists()), None)
+    if adapter_file is None:
+        raise SystemExit(
+            f"ERROR: no adapter weights in {adapter_dir}. Continuing without "
+            "them would discard the trained LoRA.")
+    from peft import set_peft_model_state_dict
+    if adapter_file.suffix == ".safetensors":
+        from safetensors.torch import load_file
+        lora_sd = load_file(str(adapter_file))
+    else:
+        lora_sd = torch.load(adapter_file, map_location="cpu")
+    incompat = set_peft_model_state_dict(llm_module, lora_sd)
+    unexpected = getattr(incompat, "unexpected_keys", None)
+    print(f"  LoRA adapter loaded ({len(lora_sd)} tensors)"
+          + (f" - unexpected keys: {unexpected}" if unexpected else ""))
+
+
+# -- warm start (Stage 2b picks up where Stage 2a left off) --------------------
+# Stage 2b writes to a DIFFERENT --output-dir than 2a, and --resume only ever
+# looks inside its own output dir. Without --init-from, Stage 2b would start
+# from a randomly initialised projector at lr 2e-5 -- a fine-tuning LR far too
+# low to train a projector from scratch -- silently discarding all of Stage 2a
+# and making the two-stage design pointless.
+if args.init_from:
+    src = Path(args.init_from)
+    if not src.is_dir():
+        raise SystemExit(f"ERROR: --init-from {src} is not a directory")
+    print(f"\nWarm-starting from {src}")
+    load_trained_weights(src)
+    print("  Fresh optimizer + LR schedule (weights only, step stays 0)")
+
 # -- resume from checkpoint ----------------------------------------------------
 start_step = 0
 if args.resume:
     ckpts = numbered_checkpoints(output_dir)
     if ckpts:
         latest = ckpts[-1]
-        resume_step = int(latest.name.split("-")[-1])
-        print(f"\nResuming from {latest.name} (step {resume_step})")
-        proj_path = latest / "projector.pt"
+        print(f"\nResuming from {latest.name}")
+        load_trained_weights(latest)
         state_path = latest / "training_state.pt"
-        if proj_path.exists():
-            # Load into the UNWRAPPED module: under DDP `projector` is a
-            # DistributedDataParallel whose keys are all "module."-prefixed,
-            # so loading the saved (unprefixed) state_dict into it raises a
-            # missing/unexpected-key RuntimeError.
-            projector_module.load_state_dict(
-                torch.load(proj_path, map_location=device))
-            print("  Projector weights loaded")
-        else:
-            raise SystemExit(f"ERROR: {proj_path} missing - cannot resume")
-
-        # LoRA adapters are ~5M of the ~14M trainable params. Without this they
-        # silently reinitialise and the resumed run throws away half its
-        # learned weights while the loss curve looks merely "a bit worse".
-        adapter_dir = latest / "lora_adapter"
-        adapter_file = next(
-            (adapter_dir / n for n in ("adapter_model.safetensors",
-                                       "adapter_model.bin")
-             if (adapter_dir / n).exists()), None)
-        if adapter_file is None:
-            raise SystemExit(
-                f"ERROR: no adapter weights in {adapter_dir} - cannot resume. "
-                "Resuming without them would discard the trained LoRA.")
-        from peft import set_peft_model_state_dict
-        if adapter_file.suffix == ".safetensors":
-            from safetensors.torch import load_file
-            lora_sd = load_file(str(adapter_file))
-        else:
-            lora_sd = torch.load(adapter_file, map_location="cpu")
-        incompat = set_peft_model_state_dict(llm_module, lora_sd)
-        missing = getattr(incompat, "unexpected_keys", None)
-        print(f"  LoRA adapter loaded ({len(lora_sd)} tensors)"
-              + (f" - unexpected keys: {missing}" if missing else ""))
-
-        if state_path.exists():
-            state = torch.load(state_path, map_location="cpu")
-            optimizer.load_state_dict(state["optimizer"])
-            start_step = state["step"] + 1
-            print(f"  Optimizer state loaded. Resuming at step {start_step}")
-        else:
+        if not state_path.exists():
             raise SystemExit(
                 f"ERROR: {state_path} missing - refusing to resume without "
                 "optimizer state (Adam moments would restart cold).")
+        state = torch.load(state_path, map_location="cpu")
+        optimizer.load_state_dict(state["optimizer"])
+        start_step = state["step"] + 1
+        print(f"  Optimizer state loaded. Resuming at step {start_step}")
     else:
         print("  No checkpoint found - starting from scratch")
 

@@ -68,7 +68,8 @@ parser.add_argument("--chat", action="store_true",
                     help="Interactive loop: keep asking about the same image")
 parser.add_argument("--token-budget", type=int, default=512,
                     help="Must match training (512) — see docs/TRAINING_GUIDE.md")
-parser.add_argument("--image-size", type=int, default=384)
+parser.add_argument("--image-size", type=int, default=512,
+                    help="MUST match Stage 2 training (512). The encoder was\n                         pretrained at 384/448, but Stage 2 trains the projector\n                         at 512 — inferring at a different size is off-distribution.")
 parser.add_argument("--hidden-dim", type=int, default=2048,
                     help="Projector MLP hidden dim — must match the trained checkpoint")
 parser.add_argument("--max-new-tokens", type=int, default=256)

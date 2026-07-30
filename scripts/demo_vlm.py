@@ -82,6 +82,32 @@ args = parser.parse_args()
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 DTYPE = torch.bfloat16 if device.type == "cuda" else torch.float32
 
+# -- adopt the checkpoint's own training config --------------------------------
+# token_budget / image_size / hidden_dim must match training exactly or output
+# degrades with no error. Rather than trusting CLI defaults (which is how this
+# script came to run at 384 against a projector trained at 512), read the
+# config.json the trainer writes beside the weights. Explicit CLI flags still
+# win, so an intentional override is still possible.
+_ckpt_dir = Path(args.projector_ckpt).parent
+_cfg_path = _ckpt_dir / "config.json"
+if _cfg_path.exists():
+    import json as _json
+    _cfg = _json.loads(_cfg_path.read_text())
+    _given = {a.split("=")[0].lstrip("-").replace("-", "_") for a in sys.argv[1:]
+              if a.startswith("--")}
+    for key in ("token_budget", "image_size", "hidden_dim"):
+        if key in _cfg and key not in _given and getattr(args, key) != _cfg[key]:
+            print(f"  [config] {key}: {getattr(args, key)} -> {_cfg[key]} "
+                  f"(from {_cfg_path.name})")
+            setattr(args, key, _cfg[key])
+    if _cfg.get("val"):
+        print(f"  [config] checkpoint step {_cfg.get('step')}, "
+              f"val: {_cfg['val']}")
+else:
+    print(f"  [config] no config.json in {_ckpt_dir} - using CLI values "
+          f"(image_size={args.image_size}, token_budget={args.token_budget}). "
+          "Verify these match training.")
+
 # -- load vision encoder -------------------------------------------------------
 print(f"[1/3] Vision encoder: {args.vision_ckpt}")
 vision = AutoModel.from_pretrained(args.vision_ckpt, dtype=DTYPE).to(device).eval()

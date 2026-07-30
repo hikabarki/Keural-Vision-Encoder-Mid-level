@@ -412,6 +412,13 @@ else:  # llava-json
 
 
 # -- checkpoint save / rotate --------------------------------------------------
+# Most recent validation result, and the best checkpoint seen so far. Populated
+# by the training loop; validation runs BEFORE the save at any shared step, so
+# LATEST_VAL is current when save_checkpoint reads it.
+LATEST_VAL: dict = {}
+BEST = {"ppl": float("inf"), "step": None}
+
+
 def save_checkpoint(step: int) -> None:
     if not IS_MAIN:
         return  # rank 0 owns checkpointing; other ranks hold identical weights
@@ -419,12 +426,74 @@ def save_checkpoint(step: int) -> None:
     ckpt_dir.mkdir(exist_ok=True)
     torch.save(projector_module.state_dict(), ckpt_dir / "projector.pt")
     llm_module.save_pretrained(ckpt_dir / "lora_adapter")
+
+    # Inference-critical config. Weights alone do NOT describe how to run the
+    # model: token_budget, image_size and hidden_dim must match training exactly
+    # or output degrades silently. demo_vlm.py defaulted to image_size 384 while
+    # Stage 2 trained at 512 precisely because nothing in the checkpoint said
+    # otherwise. Anyone loading this dir months from now reads it from here.
+    config = {
+        "step": step,
+        "stage": Path(args.output_dir).name,
+        # -- must match at inference --
+        "token_budget": args.token_budget,
+        "image_size": args.image_size,
+        "hidden_dim": args.hidden_dim,
+        "encoder_dim": encoder_dim,
+        "llm_dim": llm_dim,
+        "llm_name": args.llm_name,
+        "vision_ckpt": args.vision_ckpt,
+        # -- provenance --
+        "seed": args.seed,
+        "lr": args.lr,
+        "warmup_steps": args.warmup_steps,
+        "max_steps": args.max_steps,
+        "batch_size": args.batch_size,
+        "grad_accum": args.grad_accum,
+        "world_size": WORLD,
+        "eff_batch": args.batch_size * args.grad_accum * WORLD,
+        "max_caption_length": args.max_caption_length,
+        "lora_r": args.lora_r,
+        "lora_alpha": args.lora_alpha,
+        "init_from": args.init_from,
+        "data": args.jsonl_path or args.tar_dir,
+        # -- quality at this checkpoint --
+        "val": {lang: {"loss": L, "ppl": ppl}
+                for lang, (L, ppl) in LATEST_VAL.items()},
+    }
+    (ckpt_dir / "config.json").write_text(json.dumps(config, indent=2))
+
     torch.save({"step": step, "optimizer": optimizer.state_dict(),
                 "encoder_dim": encoder_dim, "llm_dim": llm_dim,
-                "llm_name": args.llm_name},
+                "llm_name": args.llm_name, "seed": args.seed,
+                # RNG state so a resumed run continues the same stochastic
+                # stream (dropout, shuffling) instead of silently diverging.
+                "rng": {"python": random.getstate(),
+                        "torch": torch.get_rng_state(),
+                        "cuda": torch.cuda.get_rng_state_all()
+                        if torch.cuda.is_available() else None}},
                ckpt_dir / "training_state.pt")
-    print(f"[train] Saved checkpoint-{step} to {ckpt_dir}")
+
+    val_note = ""
+    if LATEST_VAL:
+        val_note = "  val: " + " | ".join(f"{lang} ppl={ppl:.2f}"
+                                          for lang, (_, ppl) in LATEST_VAL.items())
+        primary = next(iter(LATEST_VAL.values()))[1]
+        if primary < BEST["ppl"]:
+            BEST.update(ppl=primary, step=step)
+            (output_dir / "best_checkpoint.json").write_text(json.dumps(
+                {"step": step, "ppl": primary,
+                 "checkpoint": f"checkpoint-{step}"}, indent=2))
+            val_note += "  <- BEST so far"
+    print(f"[train] Saved checkpoint-{step} to {ckpt_dir}{val_note}")
+
+    # Rotation keeps the last 3, but NEVER deletes the best-scoring checkpoint.
+    # Validation can worsen late in a run; unconditional rotation would delete
+    # the best model and leave only worse ones.
     for old in numbered_checkpoints(output_dir)[:-3]:
+        if BEST["step"] is not None and old.name == f"checkpoint-{BEST['step']}":
+            print(f"[train] Keeping {old.name} (best val ppl={BEST['ppl']:.2f})")
+            continue
         shutil.rmtree(old, ignore_errors=True)
         print(f"[train] Removed old checkpoint {old.name}")
 
@@ -602,6 +671,8 @@ try:
             if IS_MAIN and val_sets and step > 0 and step % args.val_every == 0:
                 vres = run_validation()
                 if vres:
+                    LATEST_VAL.clear()
+                    LATEST_VAL.update(vres)
                     parts = " | ".join(
                         f"{lang} loss={L:.4f} ppl={ppl:.2f}" for lang, (L, ppl) in vres.items())
                     rprint(f"[val]   step={step:5d}  {parts}", flush=True)

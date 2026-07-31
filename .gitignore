@@ -44,3 +44,6 @@ tiny-reference/
 
 # Local VLM test images (COCO-derived, not redistributed)
 test_images/*.jpg
+
+# Generated test clips (derived from COCO images)
+test_videos/*.mp4

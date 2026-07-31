@@ -47,3 +47,4 @@ test_images/*.jpg
 
 # Generated test clips (derived from COCO images)
 test_videos/*.mp4
+.upload_video

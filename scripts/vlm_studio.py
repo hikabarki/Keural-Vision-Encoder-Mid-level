@@ -147,6 +147,87 @@ def load_weights(B, ckpt: Path):
     st.session_state["_loaded"] = str(ckpt)
 
 
+def sample_video_frames(path: str, n: int):
+    """Uniformly sample n frames. Uniform rather than keyframe-based on purpose:
+    keyframe selection biases toward scene cuts and skips steady action."""
+    import cv2
+    cap = cv2.VideoCapture(path)
+    if not cap.isOpened():
+        return [], {}
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps = cap.get(cv2.CAP_PROP_FPS) or 0
+    if total <= 0:
+        cap.release()
+        return [], {}
+    idx = sorted({round(i * (total - 1) / max(n - 1, 1)) for i in range(n)})
+    frames = []
+    for i in idx:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, i)
+        ok, fr = cap.read()
+        if ok:
+            frames.append(Image.fromarray(cv2.cvtColor(fr, cv2.COLOR_BGR2RGB)))
+    cap.release()
+    return frames, {"total": total, "fps": fps,
+                    "duration": total / fps if fps else 0}
+
+
+@torch.no_grad()
+def answer_video(B, frames, question: str, cfg: dict, blind: bool,
+                 max_new: int, temperature: float, frame_budget: int,
+                 markers: bool = True):
+    """All frames in ONE batched encoder pass, tokens concatenated.
+
+    There is no temporal signal anywhere in this stack -- the projector and LoRA
+    saw only single images and the encoder's RoPE is spatial -- so this
+    aggregates per-frame understanding rather than perceiving motion. The
+    "Frame k:" markers are the cheapest available substitute for a temporal
+    encoding: they give the LLM explicit ordering without any training.
+    """
+    tf = T.Compose([
+        T.Resize((cfg["image_size"], cfg["image_size"])),
+        T.ToTensor(),
+        T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+    ])
+    emb = B["llm"].get_input_embeddings()
+    ed = next(emb.parameters()).device
+
+    def txt(s):
+        ids = B["tok"](s, return_tensors="pt",
+                       add_special_tokens=False).input_ids.to(ed)
+        return emb(ids).to(B["dt"])
+
+    if blind:
+        vis, n_tok = torch.zeros(1, 0, B["llm_dim"], device=ed, dtype=B["dt"]), 0
+    else:
+        px = torch.stack([tf(im.convert("RGB")) for im in frames]).to(
+            B["dev"], dtype=B["dt"])
+        out = B["vision"](px, token_budget=frame_budget)   # (F, N, D)
+        projected = B["proj"](out).to(ed)
+        mask = out.attention_mask.to(ed).bool()
+        pieces = []
+        for f in range(projected.shape[0]):
+            if markers:
+                pieces.append(txt(f"\nFrame {f + 1}: "))
+            pieces.append(projected[f][mask[f]].unsqueeze(0))   # drop padding
+        vis = torch.cat(pieces, dim=1)
+        n_tok = int(mask.sum().item())
+
+    preamble = ("" if blind else
+                f"The following are {len(frames)} frames sampled in order "
+                "from a video.\n")
+    ids = B["tok"].apply_chat_template(
+        [{"role": "user", "content": preamble + question}],
+        tokenize=True, add_generation_prompt=True, return_tensors="pt").to(ed)
+    inp = torch.cat([vis, emb(ids).to(B["dt"])], dim=1)
+    out_ids = B["llm"].generate(
+        inputs_embeds=inp,
+        attention_mask=torch.ones(inp.shape[:2], dtype=torch.long, device=ed),
+        max_new_tokens=max_new, do_sample=temperature > 0,
+        temperature=max(temperature, 1e-5), top_p=0.9,
+        pad_token_id=B["tok"].pad_token_id)
+    return B["tok"].decode(out_ids[0], skip_special_tokens=True).strip(), n_tok
+
+
 @torch.no_grad()
 def answer(B, img: Image.Image, question: str, cfg: dict,
            blind: bool, max_new: int, temperature: float) -> str:
@@ -214,7 +295,8 @@ with st.sidebar:
         free, tot = torch.cuda.mem_get_info(0)
         st.caption(f"GPU0 free {free/2**30:.0f} / {tot/2**30:.0f} GiB")
 
-tab_single, tab_batch = st.tabs(["Single image", f"Batch · test_images"])
+tab_single, tab_batch, tab_video = st.tabs(
+    ["Single image", "Batch · test_images", "Video"])
 
 with tab_single:
     c1, c2 = st.columns([1, 1.35])
@@ -284,3 +366,87 @@ with tab_batch:
                 cc2.write(out)
                 bar.progress((i + 1) / len(srcs))
             bar.empty()
+
+TEST_VIDEOS = _ROOT / "test_videos"
+
+with tab_video:
+    st.caption(
+        "Samples frames, encodes them in ONE batched pass, and concatenates the "
+        "visual tokens. This aggregates per-frame understanding — it does not "
+        "perceive motion. The projector and LoRA saw only single images and the "
+        "encoder's positional encoding is spatial, so questions about order, "
+        "direction or causality will be answered from language priors.")
+
+    vc1, vc2 = st.columns([1, 1.35])
+    with vc1:
+        vids = sorted(TEST_VIDEOS.glob("*.mp4")) if TEST_VIDEOS.is_dir() else []
+        vup = st.file_uploader("Upload a video", type=["mp4", "avi", "mov", "webm"])
+        vpick = st.selectbox("…or pick a test video", ["—"] + [p.name for p in vids])
+        vpath = None
+        if vup is not None:
+            tmp = _ROOT / ".upload_video"
+            tmp.write_bytes(vup.getbuffer())
+            vpath = str(tmp)
+        elif vpick != "—":
+            vpath = str(TEST_VIDEOS / vpick)
+        if vpath:
+            st.video(vpath)
+
+    with vc2:
+        nf = st.slider("Frames sampled", 2, 16, 8)
+        # The single most consequential knob: at 128 tokens/frame a validated
+        # test clip lost BOTH people in shot and misread rainbow headwear as
+        # flags; at 384 it described them correctly.
+        fb = st.select_slider("Vision tokens per frame",
+                              options=[64, 128, 192, 256, 384, 512], value=384,
+                              help="Total visual context = frames x this. Below "
+                                   "~256 the primary subject starts disappearing "
+                                   "— measured, not guessed.")
+        st.caption(f"→ {nf} × {fb} = **{nf*fb} visual tokens**"
+                   f"  (a single image uses {cfg['token_budget']})")
+        vq = st.text_area("Question", "What is happening in this video?", height=80,
+                          key="vq")
+        vmark = st.checkbox("Interleave 'Frame k:' markers", value=True,
+                            help="Cheapest substitute for a temporal encoding. "
+                                 "Untick to see how much it contributes.")
+        vblind = st.checkbox("Also run BLIND (no video)", value=True, key="vblind")
+        vgo = st.button("Run", type="primary", use_container_width=True, key="vgo")
+
+    if vgo:
+        if not vpath:
+            st.warning("Choose a video first.")
+        else:
+            frames, meta = sample_video_frames(vpath, nf)
+            if not frames:
+                st.error("Could not decode any frames from that file.")
+            else:
+                if meta:
+                    st.caption(f"{len(frames)} frames sampled from {meta['total']} "
+                               f"({meta['duration']:.1f}s @ {meta['fps']:.0f}fps)")
+                # Show what the model actually saw. Inspecting the sampled frames
+                # is how a bad crop gets caught before the output is misread.
+                st.write("**Sampled frames**")
+                for row in range(0, len(frames), 8):
+                    for col, fr in zip(st.columns(min(8, len(frames) - row)),
+                                       frames[row:row + 8]):
+                        col.image(fr, use_container_width=True)
+                B = load_base(DEFAULT_VISION, "Qwen/Qwen2.5-7B-Instruct",
+                              cfg.get("hidden_dim", 2048))
+                load_weights(B, sel)
+                with st.spinner(f"Encoding {len(frames)} frames…"):
+                    seen, ntok = answer_video(B, frames, vq, cfg, False, max_new,
+                                              temperature, fb, vmark)
+                    blind_a = (answer_video(B, frames, vq, cfg, True, max_new,
+                                            temperature, fb, vmark)[0]
+                               if vblind else None)
+                st.caption(f"{ntok} real visual tokens after padding removal")
+                if vblind:
+                    a, b = st.columns(2)
+                    a.markdown("**🎬 With video**")
+                    a.info(seen)
+                    b.markdown("**🚫 Blind (no video)**")
+                    b.warning(blind_a)
+                    st.caption("Content in BOTH columns came from the language "
+                               "model, not from your encoder.")
+                else:
+                    st.info(seen)

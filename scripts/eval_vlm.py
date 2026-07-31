@@ -214,18 +214,42 @@ elif args.benchmark == "vqav2":
     ds = load_dataset("lmms-lab/VQAv2", split="validation")
     if args.limit:
         ds = ds.select(range(min(args.limit, len(ds))))
-    total = 0.0
+    total, lenient, samples = 0.0, 0.0, []
     for it in tqdm(ds, desc="VQAv2"):
         q = it["question"] + "\nAnswer the question using a single word or phrase."
-        pred = norm(ask(it["image"], q))
+        raw = ask(it["image"], q)
+        pred = norm(raw)
         # lmms-lab/VQAv2 stores each annotation as a dict
         # {"answer", "answer_confidence", "answer_id"} -- not a bare string.
         # Passing the dict straight to norm() raised AttributeError and killed
         # the whole benchmark after the model had already loaded.
-        golds = [a["answer"] if isinstance(a, dict) else a for a in it["answers"]]
-        total += min([norm(a) for a in golds].count(pred) / 3.0, 1.0)
-    results.update({"accuracy": total / len(ds), "n": len(ds)})
-    print(f"\nVQAv2  n={len(ds)}  soft accuracy {results['accuracy']*100:.2f}%")
+        golds = [norm(a["answer"] if isinstance(a, dict) else a)
+                 for a in it["answers"]]
+        total += min(golds.count(pred) / 3.0, 1.0)
+
+        # Lenient score: a gold answer counts if it appears as a whole word in
+        # the prediction. Stage 2b trained only on verbose LLaVA-Instruct
+        # conversations -- no short-answer VQA data -- so the model replies
+        # "Yes, this is a bowl of rice noodle soup." where VQAv2 expects "yes".
+        # Strict exact match scores that 0, which measures output FORMAT rather
+        # than whether the answer was right. Reporting both separates
+        # "got it wrong" from "got it right but wouldn't shut up".
+        hits = sum(1 for g in golds
+                   if g and re.search(rf"\b{re.escape(g)}\b", pred))
+        lenient += min(hits / 3.0, 1.0)
+        if len(samples) < 30:
+            samples.append({"question": it["question"],
+                            "gold": it.get("multiple_choice_answer"),
+                            "prediction": raw})
+
+    results.update({"accuracy": total / len(ds),
+                    "lenient_accuracy": lenient / len(ds),
+                    "n": len(ds), "samples": samples})
+    print(f"\nVQAv2  n={len(ds)}")
+    print(f"  strict soft accuracy  {results['accuracy']*100:.2f}%   "
+          "(exact match — penalises verbose answers)")
+    print(f"  lenient accuracy      {results['lenient_accuracy']*100:.2f}%   "
+          "(gold appears in the answer)")
 
 # ----------------------------------------------------------------- MME --------
 elif args.benchmark == "mme":

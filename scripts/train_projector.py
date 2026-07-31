@@ -588,6 +588,14 @@ def run_validation():
         if tot_tok:
             L = tot_loss / tot_tok
             out[lang] = (L, float(torch.exp(torch.tensor(L))))
+        else:
+            # Every record was skipped -- almost always because `image` paths in
+            # this val file do not resolve under --val-image-root. That used to
+            # drop the language from the report with no message at all, so a
+            # bilingual run could silently monitor only one of its two languages.
+            print(f"[val] WARNING: '{lang}' produced NO usable records "
+                  f"({len(recs)} loaded). Check that its image paths resolve "
+                  f"under --val-image-root={args.val_image_root}", flush=True)
     if was_training:
         projector_module.train(); llm_module.train()
     return out

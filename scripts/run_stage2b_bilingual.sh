@@ -78,7 +78,7 @@ nohup torchrun --nproc_per_node=2 --master_port=29517 \
   --max-caption-length 512 \
   --save-every 1000 \
   --log-every 10 \
-  --val-jsonl "en:$DATA/llava-instruct/train_150k_val.jsonl" "ko:$DATA/kollava-instruct/train_ko_coco_val.jsonl" \
+  --val-jsonl "en:$DATA/llava-instruct/train_150k_val_rooted.jsonl" "ko:$DATA/kollava-instruct/train_ko_coco_val.jsonl" \
   --val-image-root "$DATA" \
   --val-every 250 \
   --val-samples 64 \

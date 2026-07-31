@@ -17,7 +17,7 @@ cd /home/work/Hika/vision-encoder/mid
 
 DATA=/home/work/keural-model/vlm-datasets
 OUT=outputs/projector_2b_bilingual
-MERGED=$DATA/mixed_en_ko_instruct.jsonl
+MERGED="$DATA/mixed_en_ko_instruct_v2.jsonl"
 
 USED=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits | awk '{s+=$1} END {print s+0}')
 if [ "$USED" -gt 20000 ]; then

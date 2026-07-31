@@ -85,8 +85,21 @@ parser.add_argument("--no-vision", action="store_true",
                     help="BLIND BASELINE: drop the visual tokens entirely and answer "
                          "from text alone. Compare against the normal run to measure "
                          "what vision actually contributes.")
+parser.add_argument("--pope-prompt", choices=["trained", "yesno"], default="trained",
+                    help="Instruction appended to POPE questions.\n"
+                         "'trained'  = the exact phrasing Stage 2b was trained on.\n"
+                         "'yesno'    = 'Answer yes or no only.' -- a phrasing the\n"
+                         "             model never saw. On the bilingual checkpoint\n"
+                         "             this collapses yes-ratio to 0.05 (answers 'no'\n"
+                         "             to everything) while the trained phrasing gives\n"
+                         "             0.483 against a gold ratio of 0.500. The model\n"
+                         "             is highly prompt-sensitive, so this flag decides\n"
+                         "             whether POPE measures perception or prompt match.")
 parser.add_argument("--output", default=None)
 args = parser.parse_args()
+
+POPE_SUFFIX = ("\nAnswer the question using a single word or phrase."
+               if args.pope_prompt == "trained" else "\nAnswer yes or no only.")
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 DTYPE = torch.bfloat16 if device.type == "cuda" else torch.float32
@@ -200,7 +213,7 @@ if args.benchmark == "pope":
         ds = ds.select(range(min(args.limit, len(ds))))
     preds, labels, unk = [], [], 0
     for it in tqdm(ds, desc="POPE"):
-        p = yes_no(ask(it["image"], it["question"] + "\nAnswer yes or no only."))
+        p = yes_no(ask(it["image"], it["question"] + POPE_SUFFIX))
         if p == "unknown":
             unk += 1; p = "no"
         preds.append(p); labels.append(norm(it["answer"]))

@@ -218,7 +218,12 @@ elif args.benchmark == "vqav2":
     for it in tqdm(ds, desc="VQAv2"):
         q = it["question"] + "\nAnswer the question using a single word or phrase."
         pred = norm(ask(it["image"], q))
-        total += min([norm(a) for a in it["answers"]].count(pred) / 3.0, 1.0)
+        # lmms-lab/VQAv2 stores each annotation as a dict
+        # {"answer", "answer_confidence", "answer_id"} -- not a bare string.
+        # Passing the dict straight to norm() raised AttributeError and killed
+        # the whole benchmark after the model had already loaded.
+        golds = [a["answer"] if isinstance(a, dict) else a for a in it["answers"]]
+        total += min([norm(a) for a in golds].count(pred) / 3.0, 1.0)
     results.update({"accuracy": total / len(ds), "n": len(ds)})
     print(f"\nVQAv2  n={len(ds)}  soft accuracy {results['accuracy']*100:.2f}%")
 

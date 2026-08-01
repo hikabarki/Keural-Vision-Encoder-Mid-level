@@ -27,6 +27,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from collections import Counter
 from pathlib import Path
 
 import streamlit as st
@@ -334,8 +335,10 @@ with st.sidebar:
         free, tot = torch.cuda.mem_get_info(0)
         st.caption(f"GPU0 free {free/2**30:.0f} / {tot/2**30:.0f} GiB")
 
-tab_chat, tab_single, tab_batch, tab_video = st.tabs(
-    ["💬 Chat", "Single image", "Batch · test_images", "Video"])
+(tab_chat, tab_single, tab_batch, tab_video,
+ tab_compare, tab_look, tab_prompt, tab_results) = st.tabs(
+    ["💬 Chat", "Single image", "Batch · test_images", "Video",
+     "⚖️ Compare models", "👁 Where it looks", "🎛 Prompt lab", "📊 Results"])
 
 with tab_chat:
     cc1, cc2 = st.columns([1, 2])
@@ -562,3 +565,222 @@ with tab_video:
                                "model, not from your encoder.")
                 else:
                     st.info(seen)
+
+
+# =============================================================================
+# Compare models — the same question through several checkpoints
+# =============================================================================
+with tab_compare:
+    st.caption(
+        "Runs one image and one question through several checkpoints back to back. "
+        "The base LLM stays resident and only the projector (18 MB) and LoRA "
+        "adapter (20 MB) swap, so each extra model costs an inference, not a load.")
+    kc1, kc2 = st.columns([1, 2])
+    with kc1:
+        srcs = sorted(TEST_IMAGES.glob("*.jpg")) if TEST_IMAGES.is_dir() else []
+        mup = st.file_uploader("Image", type=["jpg", "jpeg", "png", "webp"], key="mup")
+        mpick = st.selectbox("…or a test image", ["—"] + [p.name for p in srcs], key="mpick")
+        m_img = (Image.open(mup) if mup is not None
+                 else (Image.open(TEST_IMAGES / mpick) if mpick != "—" else None))
+        if m_img is not None:
+            st.image(m_img, use_container_width=True)
+    with kc2:
+        picks = st.multiselect(
+            "Checkpoints to compare", ckpts,
+            default=ckpts[:3],
+            format_func=lambda p: f"{p.parent.name}/{p.name}")
+        mq = st.text_area("Question", "Describe this image.", height=80, key="mq")
+        mblind = st.checkbox("Add a blind row (no image)", value=True, key="mblind")
+        if st.button("Compare", type="primary", use_container_width=True, key="mgo"):
+            if m_img is None or not picks:
+                st.warning("Pick an image and at least one checkpoint.")
+            else:
+                B = load_base(DEFAULT_VISION, "Qwen/Qwen2.5-7B-Instruct",
+                              cfg.get("hidden_dim", 2048))
+                bar = st.progress(0.0)
+                rows = []
+                for i, c in enumerate(picks):
+                    ccfg = ckpt_config(c)
+                    load_weights(B, c)
+                    a = answer(B, m_img, mq + suffix, ccfg, False, max_new, temperature)
+                    rows.append((f"{c.parent.name}/{c.name}", ccfg, a))
+                    bar.progress((i + 1) / (len(picks) + (1 if mblind else 0)))
+                blind_txt = None
+                if mblind:
+                    blind_txt = answer(B, m_img, mq + suffix, cfg, True, max_new, temperature)
+                    bar.progress(1.0)
+                bar.empty()
+                for name, ccfg, a in rows:
+                    v = ccfg.get("val") or {}
+                    meta = " · ".join(f"{k} ppl {x['ppl']:.2f}" for k, x in v.items())
+                    st.markdown(f"**{name}**" + (f"  ·  {meta}" if meta else ""))
+                    st.info(a)
+                if blind_txt is not None:
+                    st.markdown("**🚫 Blind — no image (any model agreeing with this "
+                                "row is reciting language priors)**")
+                    st.warning(blind_txt)
+
+
+# =============================================================================
+# Where it looks — saliency map and ATB token placement
+# =============================================================================
+with tab_look:
+    st.caption(
+        "The saliency predictor decides WHERE the ATB tokenizer spends its budget. "
+        "This view is specific to this architecture: a fixed-grid encoder has "
+        "nothing equivalent to show, because its token positions never move.")
+    lc1, lc2 = st.columns([1, 1.4])
+    with lc1:
+        srcs = sorted(TEST_IMAGES.glob("*.jpg")) if TEST_IMAGES.is_dir() else []
+        lup = st.file_uploader("Image", type=["jpg", "jpeg", "png", "webp"], key="lup")
+        lpick = st.selectbox("…or a test image", ["—"] + [p.name for p in srcs], key="lpick")
+        l_img = (Image.open(lup) if lup is not None
+                 else (Image.open(TEST_IMAGES / lpick) if lpick != "—" else None))
+        lbudget = st.select_slider("Token budget", options=[128, 256, 512, 1024, 2048],
+                                   value=cfg["token_budget"], key="lbud")
+        lgo = st.button("Analyse", type="primary", use_container_width=True, key="lgo")
+    with lc2:
+        if lgo and l_img is not None:
+            import numpy as np
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+
+            B = load_base(DEFAULT_VISION, "Qwen/Qwen2.5-7B-Instruct",
+                          cfg.get("hidden_dim", 2048))
+            load_weights(B, sel)
+            tf = T.Compose([T.Resize((cfg["image_size"], cfg["image_size"])), T.ToTensor(),
+                            T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])])
+            with torch.no_grad():
+                pv = tf(l_img.convert("RGB")).unsqueeze(0).to(B["dev"], dtype=B["dt"])
+                out, sal = B["vision"](pv, token_budget=int(lbudget),
+                                       return_saliency_map=True)
+            sal_np = sal[0, 0].float().cpu().numpy()
+            base = np.asarray(l_img.convert("RGB").resize(
+                (cfg["image_size"], cfg["image_size"])))
+
+            fig, axes = plt.subplots(1, 3, figsize=(11, 3.9))
+            axes[0].imshow(base); axes[0].set_title("input", fontsize=9)
+            axes[1].imshow(sal_np, cmap="inferno")
+            axes[1].set_title("saliency map", fontsize=9)
+            axes[2].imshow(base)
+            md = out.spatial_metadata[0].float().cpu().numpy()
+            lv = out.level_ids[0].cpu().numpy()
+            S = cfg["image_size"]
+            COL = {0: "#2a78d6", 1: "#eb6834", 2: "#1baf7a"}
+            NAME = {0: "global", 1: "region", 2: "detail"}
+            for level in (0, 1, 2):
+                m = lv == level
+                if m.any():
+                    axes[2].scatter(md[m, 0] * S, md[m, 1] * S, s=9 if level == 2 else 26,
+                                    c=COL[level], alpha=0.75, edgecolors="none",
+                                    label=f"{NAME[level]} ({int(m.sum())})")
+            axes[2].legend(fontsize=7, loc="lower right", framealpha=0.85)
+            axes[2].set_title("token placement by level", fontsize=9)
+            for a in axes:
+                a.set_xticks([]); a.set_yticks([])
+            fig.tight_layout()
+            st.pyplot(fig)
+
+            c = Counter(int(v) for v in lv)
+            st.caption(
+                f"{len(lv)} tokens at budget {lbudget} — "
+                + ", ".join(f"{NAME[k]} {c.get(k,0)}" for k in (0, 1, 2))
+                + f" · saliency range {sal_np.min():.3f}–{sal_np.max():.3f}, "
+                f"mean {sal_np.mean():.3f}")
+            st.caption(
+                "A saliency map that is flat (min≈max) means the predictor has "
+                "collapsed and tokens are effectively being placed on a grid — the "
+                "anti-collapse term in the Stage 1 loss exists to prevent exactly that.")
+        elif lgo:
+            st.warning("Choose an image first.")
+
+
+# =============================================================================
+# Prompt lab — the same question, worded several ways
+# =============================================================================
+with tab_prompt:
+    st.caption(
+        "This model is measurably sensitive to phrasing. On POPE the instruction "
+        "“Answer yes or no only” collapsed the yes-ratio to 0.050, while the "
+        "phrasing it was trained on gave 0.492 against a gold ratio of 0.500 — same "
+        "model, same images, same questions. This tab makes that visible on your own "
+        "inputs before it surprises you in a demo.")
+    pc1, pc2 = st.columns([1, 1.6])
+    with pc1:
+        srcs = sorted(TEST_IMAGES.glob("*.jpg")) if TEST_IMAGES.is_dir() else []
+        pup = st.file_uploader("Image", type=["jpg", "jpeg", "png", "webp"], key="pup")
+        ppick = st.selectbox("…or a test image", ["—"] + [p.name for p in srcs], key="ppick")
+        p_img = (Image.open(pup) if pup is not None
+                 else (Image.open(TEST_IMAGES / ppick) if ppick != "—" else None))
+        if p_img is not None:
+            st.image(p_img, use_container_width=True)
+    with pc2:
+        core = st.text_input("Core question", "Is there a person in this image?", key="pcore")
+        DEFAULT_VARIANTS = "\n".join([
+            "",
+            " Answer the question using a single word or phrase.",
+            " Answer yes or no only.",
+            " Answer in one short sentence.",
+            " Please describe what you see, then answer.",
+        ])
+        variants = st.text_area(
+            "Instruction suffixes (one per line, blank line = no instruction)",
+            DEFAULT_VARIANTS, height=140, key="pvars")
+        if st.button("Run all phrasings", type="primary", use_container_width=True, key="pgo"):
+            if p_img is None:
+                st.warning("Choose an image first.")
+            else:
+                B = load_base(DEFAULT_VISION, "Qwen/Qwen2.5-7B-Instruct",
+                              cfg.get("hidden_dim", 2048))
+                load_weights(B, sel)
+                lines = variants.split("\n")
+                bar = st.progress(0.0)
+                for i, sfx in enumerate(lines):
+                    a = answer(B, p_img, core + sfx, cfg, False, max_new, temperature)
+                    label = sfx.strip() or "(no instruction)"
+                    st.markdown(f"**{label}**")
+                    st.info(a)
+                    bar.progress((i + 1) / max(len(lines), 1))
+                bar.empty()
+                st.caption("Large differences between rows mean the model is keying on "
+                           "instruction format, not only on the image.")
+
+
+# =============================================================================
+# Results — every evaluation on disk, in one table
+# =============================================================================
+with tab_results:
+    st.caption("Reads the evaluation JSON written by scripts/eval_vlm.py. Nothing here "
+               "is typed by hand, so it cannot drift from the measurements.")
+    import glob as _glob
+    files = sorted(_glob.glob(str(_ROOT / "outputs/eval_2b/*.json"))
+                   + _glob.glob(str(_ROOT / "outputs/queue/*.json")))
+    rows = []
+    for f in files:
+        try:
+            d = json.loads(Path(f).read_text())
+        except Exception:
+            continue
+        if not isinstance(d, dict) or "benchmark" not in d:
+            continue
+        r = {"file": Path(f).name, "benchmark": d.get("benchmark"),
+             "blind": bool(d.get("blind_baseline")), "n": d.get("n")}
+        if "categories" in d:
+            r["n"] = sum(v.get("n", 0) for v in d["categories"].values())
+            r["score"] = round(sum(v.get("score", 0) for v in d["categories"].values()), 1)
+            r["categories"] = len(d["categories"])
+        for k in ("accuracy", "lenient_accuracy", "f1", "yes_ratio"):
+            if k in d:
+                r[k] = round(d[k] * (1 if k == "yes_ratio" else 100), 3)
+        if "languages" in d:
+            for lang, v in d["languages"].items():
+                r[f"ppl_{lang}"] = round(v["perplexity"], 3)
+        rows.append(r)
+    if rows:
+        st.dataframe(rows, use_container_width=True, hide_index=True)
+        st.caption(f"{len(rows)} result files. A benchmark row with blind = True is the "
+                   "no-vision baseline for the row above it; the DIFFERENCE between the "
+                   "two is what the vision encoder contributes.")
+    else:
+        st.info("No evaluation results found yet. Run scripts/run_eval_2b.sh.")

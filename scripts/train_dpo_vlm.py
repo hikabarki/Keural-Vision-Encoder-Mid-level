@@ -8,11 +8,20 @@ Stage 3 — Direct Preference Optimization for the Keural Mid VLM.
 What trains and what does not
 -----------------------------
 Only the LoRA adapters train. The vision encoder and the projector are both
-frozen, which is a deliberate choice rather than a shortcut: with the projector
-frozen, disabling the LoRA adapter yields an EXACT reference policy pi_ref, so
-no second copy of the 7B decoder is needed and the KL term in the DPO objective
-is exact rather than approximate. Preference over responses is a property of the
-decoder; the projector is already aligned by Stage 2.
+frozen: preference over responses is a property of the decoder, and the
+projector is already aligned by Stage 2.
+
+The reference policy
+--------------------
+DPO requires pi_ref to be the SFT policy training starts from -- here Qwen2.5-7B
+PLUS the Stage 2b LoRA. It is NOT base Qwen. Disabling the adapter would give
+base Qwen and constrain the policy toward the wrong model, so instead the
+reference log-probabilities are PRECOMPUTED once, before any weight update, with
+the Stage 2b adapter active. Because pi_ref is frozen by definition, those values
+never change, so caching them is exact rather than an approximation -- and it
+removes two forward passes from every training step. The cache is keyed by the
+base checkpoint so it cannot be silently reused across different starting
+models.
 
 The objective
 -------------
@@ -209,26 +218,55 @@ def seq_logprob(vis, prompt_ids, resp_ids):
     return logp.gather(-1, resp_ids.unsqueeze(-1)).squeeze(-1).sum(-1)
 
 
-def pair_logprobs(row, with_grad):
-    """(policy_chosen, policy_rejected, ref_chosen, ref_rejected) for one pair."""
+REF: dict[str, tuple[float, float]] = {}
+
+
+@torch.no_grad()
+def precompute_reference(rows, tag):
+    """Reference log-probs under the STAGE 2 model, computed before any update.
+
+    pi_ref is frozen by definition, so these are exact for the whole run."""
+    cache = out_dir / f"ref_cache_{tag}.json"
+    key = str(Path(args.base).resolve())
+    if cache.exists():
+        blob = json.loads(cache.read_text())
+        if blob.get("base") == key:
+            print(f"  reusing {cache.name} ({len(blob['ref']):,} pairs)")
+            return {k: tuple(v) for k, v in blob["ref"].items()}
+        print(f"  {cache.name} was built from a different base — recomputing")
+    llm.eval()
+    ref, t0 = {}, time.time()
+    for i, row in enumerate(rows):
+        try:
+            vis = visual_prefix(row["image"])
+            pc, rc = build(row["question"], row["chosen"])
+            pr, rr = build(row["question"], row["rejected"])
+            ref[row["id"]] = (float(seq_logprob(vis, pc, rc)),
+                              float(seq_logprob(vis, pr, rr)))
+        except Exception:
+            continue
+        if (i + 1) % 250 == 0:
+            el = time.time() - t0
+            print(f"    {i+1:,}/{len(rows):,}  eta {(el/(i+1)*(len(rows)-i-1))/60:.0f}m",
+                  flush=True)
+    llm.train()
+    cache.write_text(json.dumps({"base": key, "ref": ref}))
+    print(f"  cached {len(ref):,} reference pairs -> {cache.name}")
+    return ref
+
+
+def dpo_terms(row, with_grad=True):
+    r = REF.get(row["id"])
+    if r is None:
+        raise KeyError("no reference logprob for this pair")
+    ref_c, ref_r = r
     vis = visual_prefix(row["image"])
     pc, rc = build(row["question"], row["chosen"])
     pr, rr = build(row["question"], row["rejected"])
-
     ctx = torch.enable_grad() if with_grad else torch.no_grad()
     with ctx:
         pol_c = seq_logprob(vis, pc, rc)
         pol_r = seq_logprob(vis, pr, rr)
-    # Reference = identical model with the adapter switched off. Exact, because
-    # the projector and encoder are frozen and therefore shared.
-    with torch.no_grad(), llm.disable_adapter():
-        ref_c = seq_logprob(vis, pc, rc)
-        ref_r = seq_logprob(vis, pr, rr)
-    return pol_c, pol_r, ref_c, ref_r
-
-
-def dpo_terms(row, with_grad=True):
-    pol_c, pol_r, ref_c, ref_r = pair_logprobs(row, with_grad)
     d_c = pol_c - ref_c            # implicit reward, chosen
     d_r = pol_r - ref_r            # implicit reward, rejected
     logits = args.beta * (d_c - d_r)
@@ -252,6 +290,25 @@ def run_val():
     n = max(len(losses), 1)
     return sum(losses) / n, correct / n, sum(margins) / n
 
+
+print("\nPrecomputing reference log-probabilities (pi_ref = the Stage 2 model)…")
+REF.update(precompute_reference(train_rows, "train"))
+REF.update(precompute_reference(val_rows, "val"))
+# Sanity: at step 0 the policy IS the reference, so the implicit reward margin
+# must be ~0. A large value here means the reference is the wrong model.
+_probe = [r for r in val_rows[:8] if r["id"] in REF]
+if _probe:
+    ms = []
+    for r in _probe:
+        try:
+            _, _, m = dpo_terms(r, with_grad=False)
+            ms.append(m)
+        except Exception:
+            pass
+    if ms:
+        mm = sum(abs(x) for x in ms) / len(ms)
+        print(f"  step-0 |margin| = {mm:.4f} over {len(ms)} pairs "
+              f"({'OK — policy == reference' if mm < 0.05 else 'WARNING — reference mismatch'})")
 
 opt = torch.optim.AdamW(trainable, lr=args.lr, weight_decay=0.0, betas=(0.9, 0.999))
 

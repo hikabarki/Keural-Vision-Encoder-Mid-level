@@ -229,6 +229,45 @@ def answer_video(B, frames, question: str, cfg: dict, blind: bool,
 
 
 @torch.no_grad()
+def visual_tokens(B, img: Image.Image, cfg: dict):
+    """Project one image to LLM-space tokens. Cached per image in the chat tab so
+    a follow-up question does not re-run the encoder."""
+    tf = T.Compose([
+        T.Resize((cfg["image_size"], cfg["image_size"])),
+        T.ToTensor(),
+        T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+    ])
+    ed = next(B["llm"].get_input_embeddings().parameters()).device
+    pv = tf(img.convert("RGB")).unsqueeze(0).to(B["dev"], dtype=B["dt"])
+    return B["proj"](B["vision"](pv, token_budget=cfg["token_budget"])).to(ed)
+
+
+@torch.no_grad()
+def answer_chat(B, vis, history, cfg: dict, max_new: int, temperature: float) -> str:
+    """Multi-turn answer.
+
+    The visual tokens are prepended ONCE and the entire conversation is then
+    rendered through the decoder's own chat template, so turn 3 can see turns 1
+    and 2. This matches how Stage 2b was trained: LLaVA-Instruct conversations
+    are multi-turn with assistant-only label masking, so the model has seen this
+    exact layout.
+    """
+    emb = B["llm"].get_input_embeddings()
+    ed = next(emb.parameters()).device
+    ids = B["tok"].apply_chat_template(
+        history, tokenize=True, add_generation_prompt=True,
+        return_tensors="pt").to(ed)
+    inp = torch.cat([vis.to(ed), emb(ids).to(B["dt"])], dim=1)
+    out = B["llm"].generate(
+        inputs_embeds=inp,
+        attention_mask=torch.ones(inp.shape[:2], dtype=torch.long, device=ed),
+        max_new_tokens=max_new, do_sample=temperature > 0,
+        temperature=max(temperature, 1e-5), top_p=0.9,
+        pad_token_id=B["tok"].pad_token_id)
+    return B["tok"].decode(out[0], skip_special_tokens=True).strip()
+
+
+@torch.no_grad()
 def answer(B, img: Image.Image, question: str, cfg: dict,
            blind: bool, max_new: int, temperature: float) -> str:
     tf = T.Compose([
@@ -295,8 +334,81 @@ with st.sidebar:
         free, tot = torch.cuda.mem_get_info(0)
         st.caption(f"GPU0 free {free/2**30:.0f} / {tot/2**30:.0f} GiB")
 
-tab_single, tab_batch, tab_video = st.tabs(
-    ["Single image", "Batch · test_images", "Video"])
+tab_chat, tab_single, tab_batch, tab_video = st.tabs(
+    ["💬 Chat", "Single image", "Batch · test_images", "Video"])
+
+with tab_chat:
+    cc1, cc2 = st.columns([1, 2])
+    with cc1:
+        srcs = sorted(TEST_IMAGES.glob("*.jpg")) if TEST_IMAGES.is_dir() else []
+        cup = st.file_uploader("Image", type=["jpg", "jpeg", "png", "webp"], key="cup")
+        cpick = st.selectbox("…or a test image", ["—"] + [p.name for p in srcs],
+                             key="cpick")
+        chat_img, img_key = None, None
+        if cup is not None:
+            chat_img, img_key = Image.open(cup), f"upload:{cup.name}:{cup.size}"
+        elif cpick != "—":
+            chat_img, img_key = Image.open(TEST_IMAGES / cpick), f"test:{cpick}"
+        if chat_img is not None:
+            st.image(chat_img, use_container_width=True)
+        if st.button("Clear conversation", use_container_width=True):
+            st.session_state["chat_history"] = []
+            st.session_state.pop("chat_vis", None)
+            st.rerun()
+        st.caption(f"{len(st.session_state.get('chat_history', []))} messages · "
+                   f"{sel.parent.name}/{sel.name}")
+
+    with cc2:
+        # Changing the image (or the checkpoint) invalidates both the cached
+        # visual tokens and the conversation -- a follow-up like "what colour is
+        # it?" would otherwise silently refer to the previous picture.
+        ctx_key = f"{img_key}|{sel}"
+        if st.session_state.get("chat_ctx") != ctx_key:
+            st.session_state["chat_ctx"] = ctx_key
+            st.session_state["chat_history"] = []
+            st.session_state.pop("chat_vis", None)
+
+        history = st.session_state.setdefault("chat_history", [])
+        for m in history:
+            with st.chat_message(m["role"]):
+                st.markdown(m["content"])
+
+        if chat_img is None:
+            st.info("Choose an image on the left, then ask about it. "
+                    "Follow-up questions keep the whole conversation in context.")
+        else:
+            prompt = st.chat_input("Ask about this image…")
+            if prompt:
+                history.append({"role": "user", "content": prompt})
+                with st.chat_message("user"):
+                    st.markdown(prompt)
+                B = load_base(DEFAULT_VISION, "Qwen/Qwen2.5-7B-Instruct",
+                              cfg.get("hidden_dim", 2048))
+                load_weights(B, sel)
+                if "chat_vis" not in st.session_state:
+                    with st.spinner("Encoding image…"):
+                        st.session_state["chat_vis"] = visual_tokens(B, chat_img, cfg)
+                with st.chat_message("assistant"):
+                    with st.spinner("Thinking…"):
+                        reply = answer_chat(B, st.session_state["chat_vis"],
+                                            history, cfg, max_new, temperature)
+                    st.markdown(reply)
+                history.append({"role": "assistant", "content": reply})
+                st.rerun()
+
+        with st.expander("How multi-turn works here"):
+            st.markdown(
+                "The image is encoded **once** and its visual tokens are prepended to "
+                "the whole conversation, which is then rendered through Qwen's own "
+                "chat template. Turn 3 therefore sees turns 1 and 2 — this is the "
+                "same layout Stage 2b trained on, since LLaVA-Instruct conversations "
+                "are multi-turn with assistant-only label masking.\n\n"
+                "Two caveats worth knowing while judging replies: long answers "
+                "hallucinate substantially more than short ones, so the sidebar's "
+                "**Answer length** control changes reliability, not just verbosity; "
+                "and the model is sensitive to phrasing, so a question worded like "
+                "the training data (\"Answer using a single word or phrase\") behaves "
+                "differently from one that is not.")
 
 with tab_single:
     c1, c2 = st.columns([1, 1.35])

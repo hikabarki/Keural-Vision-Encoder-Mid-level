@@ -54,20 +54,25 @@ def load(*rel):
 # ---------------------------------------------------------------------------
 # 1. Vision contribution — sighted vs blind
 # ---------------------------------------------------------------------------
-pope_s = load("outputs/eval_2b/pope_trained_outputs_projector_2b_bilingual_checkpoint-12000.json")
-pope_b = load("outputs/queue/pope_blind.json")
-vqa_s = load("outputs/eval_2b/vqav2_sighted.json")
-vqa_b = load("outputs/eval_2b/vqav2_blind.json")
+# Prefer the largest matched sighted/blind pair available so the figure agrees
+# with the report tables; fall back to the smaller early runs if absent.
+pope_s = load("outputs/queue/pope_n2000.json",
+              "outputs/eval_2b/pope_trained_outputs_projector_2b_bilingual_checkpoint-12000.json")
+pope_b = load("outputs/queue/pope_n2000_blind.json", "outputs/queue/pope_blind.json")
+vqa_s = load("outputs/queue/vqav2_n5000.json", "outputs/eval_2b/vqav2_sighted.json")
+vqa_b = load("outputs/queue/vqav2_n5000_blind.json", "outputs/eval_2b/vqav2_blind.json")
+mme_s = load("outputs/queue/mme_full.json")
+mme_b = load("outputs/queue/mme_full_blind.json")
 
 rows = []
 if pope_s and pope_b:
-    rows.append(("POPE\naccuracy", pope_s["accuracy"] * 100, pope_b["accuracy"] * 100))
+    rows.append(("POPE\naccuracy\n(n=2,000)", pope_s["accuracy"] * 100, pope_b["accuracy"] * 100))
 if pope_s and pope_b:
-    rows.append(("POPE\nF1", pope_s["f1"] * 100, pope_b["f1"] * 100))
+    rows.append(("POPE\nF1\n(n=2,000)", pope_s["f1"] * 100, pope_b["f1"] * 100))
 if vqa_s and vqa_b:
-    rows.append(("VQAv2\nstrict", vqa_s["accuracy"] * 100, vqa_b["accuracy"] * 100))
+    rows.append(("VQAv2\nstrict\n(n=5,000)", vqa_s["accuracy"] * 100, vqa_b["accuracy"] * 100))
     if "lenient_accuracy" in vqa_s:
-        rows.append(("VQAv2\nlenient", vqa_s["lenient_accuracy"] * 100,
+        rows.append(("VQAv2\nlenient\n(n=5,000)", vqa_s["lenient_accuracy"] * 100,
                      vqa_b["lenient_accuracy"] * 100))
 
 if rows:
@@ -95,6 +100,13 @@ if rows:
     ax.set_ylim(0, max(max(s_vals), max(b_vals)) * 1.30)
     ax.set_axisbelow(True)
     ax.grid(axis="x", alpha=0)
+    if mme_s and mme_b:
+        # MME is a 0-2000 point scale, not a percentage; normalise to its own
+        # maximum so it can share an axis without implying a false comparison.
+        ts = sum(v["score"] for v in mme_s["categories"].values())
+        tb = sum(v["score"] for v in mme_b["categories"].values())
+        print(f"   MME total        sighted {ts:6.1f}  blind {tb:6.1f}  gap {ts-tb:+6.1f} "
+              "(reported in the table, not plotted - different scale)")
     ax.set_title("Vision contribution — Keural Mid VLM (bilingual, checkpoint-12000)",
                  fontsize=12.5, fontweight="bold", color=INK, loc="left", pad=20)
     ax.text(0, 1.02, "The bold figure is the sighted-minus-blind gap: what the vision "

@@ -140,6 +140,30 @@ fig.tight_layout()
 fig.savefig(OUT / "stage2a_val_perplexity.png", bbox_inches="tight")
 plt.close(fig)
 
+# ---------------------------------------------------------------------------
+# 1b. Stage 2a convergence, stabilized run ONLY
+# ---------------------------------------------------------------------------
+# The comparison chart above exists because the instability is a documented
+# finding, and it belongs in the technical report. A public release repository
+# should show the pipeline that shipped, not a run that was diagnosed and
+# discarded -- so this variant plots the stabilized curve alone.
+fig, ax = plt.subplots(figsize=(7.6, 4.4))
+x, y = unzip(stab_va, 1)
+ax.plot(x, y, color=BLUE, marker="o", markersize=4)
+end_label(ax, x, y, f"{y[-1]:.1f}", BLUE)
+headroom(ax, 0.10)
+plain_log_y(ax, [18, 20, 25, 30])
+style(ax, "Stage 2a — held-out validation perplexity",
+      "training step", "perplexity (log scale, lower is better)",
+      "Projector alignment on LLaVA-Pretrain · seed 42 · peak LR 5e-4 · warmup 500")
+ax.annotate(f"{y[0]:.1f}", (x[0], y[0]), xytext=(6, 6),
+            textcoords="offset points", color=BLUE, fontsize=9, fontweight="bold")
+fig.tight_layout()
+fig.savefig(OUT / "stage2a_val_perplexity_solo.png", bbox_inches="tight")
+plt.close(fig)
+print(f"wrote stage2a_val_perplexity_solo.png  ({y[0]:.2f} -> {y[-1]:.2f} "
+      f"over {x[-1]} steps)")
+
 # =============================================================================
 # 2. Stage 2a gradient norms -- the instability, made visible
 # =============================================================================

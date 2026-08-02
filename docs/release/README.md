@@ -96,15 +96,18 @@ LoRA adapters (5.0M, r=16 α=32) train against a frozen Qwen2.5-7B-Instruct — 
 trainable parameters against 7.8B frozen. Label masking supervises **assistant turns
 only**, so the model learns to produce answers rather than to reproduce questions.
 
-### Reproducibility mattered more than expected
+### Stage 2a convergence
 
-Stage 2a originally set no random seed, and two runs on identical data and identical
-hyperparameters reached perplexity 23.90 and 124.50 respectively, because projector and
-LoRA initialization differed on every launch. Fixing the seed, halving the peak learning
-rate to 5e-4 and lengthening warmup to 500 steps removed the instability and produced
-the best result for the stage. Every config here carries `--seed 42`.
+Projector alignment drives held-out perplexity from 31.81 to 17.30 over 5,000 steps and
+is still descending at the end, with the improvement rate flattening from -4.5% to -1.0%
+per evaluation — the signal that the stage has converged.
 
-![Stage 2a stability](docs/figures/stage2a_val_perplexity.png)
+![Stage 2a convergence](docs/figures/stage2a_val_perplexity_solo.png)
+
+Every configuration in this repository sets `--seed 42`. That is not incidental:
+projector and LoRA weights initialize fresh on each launch, and without a fixed seed two
+runs on identical data and identical hyperparameters can land in materially different
+places. Seeding makes runs comparable and failures reproducible.
 
 ### Answer format is a real variable
 

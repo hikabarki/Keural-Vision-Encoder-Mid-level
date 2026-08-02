@@ -58,7 +58,7 @@ DOCS = ["ARCHITECTURE.md", "PIPELINE_TECHNICAL_SPEC.md", "BENCHMARK_COMPARISON.m
 FIGURES = ["training_loss_curves.png", "benchmark_comparison_chart.png",
            "benchmark_radar_chart.png", "benchmark_recall_curve_chart.png",
            "saliency_evolution_across_training.png",
-           "stage2a_val_perplexity.png", "stage2a_grad_norm.png",
+           "stage2a_val_perplexity_solo.png",
            "stage2b_training.png", "stage2_val_perplexity.png",
            "stage2_vision_contribution.png"]
 

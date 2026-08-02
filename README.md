@@ -4,19 +4,21 @@
 
 # Keural Mid-Level Vision Encoder
 
-**183.5M params · Adaptive Token Budget · Hierarchical Concept Tokens · Continuous 2D-RoPE · Dual-Teacher Distillation**
+**183.6M params · Adaptive Token Budget · Hierarchical Concept Tokens · Continuous 2D-RoPE · Dual-Teacher Distillation**
 
 *Built from scratch by MKD Co., Ltd. — not a fine-tuned CLIP variant.*
 
 <img alt="params" src="https://img.shields.io/badge/params-183.5M-blue">
 <img alt="pytorch" src="https://img.shields.io/badge/PyTorch-2.x-ee4c2c?logo=pytorch&logoColor=white">
 <img alt="precision" src="https://img.shields.io/badge/precision-bfloat16-informational">
-<img alt="status" src="https://img.shields.io/badge/status-training-orange">
+<img alt="status" src="https://img.shields.io/badge/status-Stage%202%20complete-success">
+<img alt="vlm" src="https://img.shields.io/badge/VLM-bilingual%20EN%2FKO-blueviolet">
 <img alt="license" src="https://img.shields.io/badge/license-proprietary-red">
 
 <br/>
 
-[**🤗 Model**](https://huggingface.co/mkd-hika/keural-vision-encoder-mid) ·
+[**🤗 Encoder**](https://huggingface.co/mkd-hika/keural-vision-encoder-mid) ·
+[**🤗 VLM (EN/KO)**](https://huggingface.co/mkd-hika/keural-mid-vlm-bilingual) ·
 [**🎬 Interactive Pipeline Diagram**](https://huggingface.co/spaces/mkd-hika/keural-vision-encoder-diagram) ·
 [**📐 Technical Spec**](docs/PIPELINE_TECHNICAL_SPEC.md) ·
 [**🔍 Architecture Audit**](docs/ARCHITECTURE_AUDIT.md)
@@ -42,6 +44,75 @@ Keural Mid is the second stage of the Keural Vision Encoder roadmap, scaling fro
 | Hardware | 1× RTX 5090 | **2× H200 141GB** | 64× H100 |
 | Text encoder | MiniLM-L6-v2 | **CLIP ViT-L/14** | CLIP ViT-L/14 |
 | Status | ✅ Complete | ✅ **Complete** (18K steps) | 📅 Planned |
+
+---
+
+## Results
+
+### Stage 1 — vision encoder
+
+| Benchmark | Result |
+|---|---|
+| ImageNet zero-shot Top-1 / Top-5 | 37.2% / 66.8% |
+| Flickr30K image→text R@1 / R@5 / R@10 | 42.9% / 72.7% / 80.6% |
+| Flickr30K text→image R@1 / R@5 / R@10 | 42.2% / 70.0% / 79.4% |
+| CIFAR-100 linear probe Top-1 | 75.0% |
+
+Zero-shot accuracy measures image–text *alignment*. For downstream use the
+CIFAR-100 linear probe is the better indicator of representation quality, because
+a trained projector relearns the alignment from scratch — which the Stage 2
+results below bear out.
+
+### Stage 2 — vision-language model
+
+The encoder is **frozen** inside the VLM; only a projector (8.9M) and LoRA
+adapters (5.0M) train on top of Qwen2.5-7B-Instruct. A VLM can score respectably
+while barely using the image, so every benchmark is run **twice** — once
+normally, once with the visual tokens removed and everything else held constant.
+**The difference is what the encoder contributes**, and it is the only figure a
+language model cannot produce on its own.
+
+| Benchmark | With image | Blind | **Encoder contributes** |
+|---|---|---|---|
+| POPE accuracy (n=2,000) | **70.50%** | 44.55% | **+25.95** |
+| POPE F1 (n=2,000) | **70.59%** | 23.46% | **+47.13** |
+| VQAv2 strict (n=5,000) | **53.04%** | 39.83% | **+13.21** |
+| MME total, 14 categories (n=2,374) | **1258.9** | 812.0 | **+446.9** |
+| MMBench (n=4,377) | 60.20% | — | — |
+| Held-out perplexity, Korean / English | 2.15 / 2.99 | — | — |
+
+POPE yes-ratio is **0.492 against a gold 0.500**, so the model discriminates on
+object-existence questions rather than defaulting to one answer — accuracy alone
+is not interpretable without that check.
+
+![Vision contribution](docs/figures/stage2_vision_contribution.png)
+
+### Training stages
+
+| Stage | What it does | Data | Steps | Outcome |
+|---|---|---|---|---|
+| 1 | Contrastive pre-training + dual-teacher distillation | 20M pairs | 18,000 | ✅ encoder |
+| 2a | Projector alignment on captions | LLaVA-Pretrain 557K | 5,000 | ✅ ppl 31.81 → 17.30 |
+| 2b | Supervised instruction tuning (SFT), English | LLaVA-Instruct 157K | 8,000 | ✅ ppl 3.22 → 2.90 |
+| 2b | SFT, bilingual EN+KO | Merged 603K | 12,000 | ✅ **recommended model** |
+| 2c | OCR specialization (two runs) | TextVQA 30K + replay | 4,000 / 2,000 | ⚠️ trade-off |
+| 3 | Direct Preference Optimization | RLHF-V 5.5K pairs | 2,000 | ❌ negative result |
+
+Every stage after SFT traded one capability for another. Stage 2c raised MME
+(1258.9 → 1337.8) and MME OCR (110.0 → 137.5) but drifted toward answering
+"yes" on binary questions. Stage 3 DPO optimized its own objective successfully
+(held-out reward accuracy 0.890) but collapsed toward answering "no"
+(POPE yes-ratio 0.503 → 0.116). **Stage 2b bilingual is the recommended
+checkpoint** — it is the only calibrated one.
+
+![Model selection](docs/figures/model_selection.png)
+
+Full analysis, including the diagnosis of each failure, is in the Technical
+Documentation Report (distributed separately — `docs/reports/` is not tracked in
+this repository). Architectural detail is in
+[PIPELINE_TECHNICAL_SPEC.md](docs/PIPELINE_TECHNICAL_SPEC.md) and
+[ARCHITECTURE.md](docs/ARCHITECTURE.md); benchmark methodology in
+[BENCHMARK_COMPARISON.md](docs/BENCHMARK_COMPARISON.md).
 
 ---
 
@@ -122,6 +193,16 @@ mid/
 │   ├── <a href="scripts/run_stage2b_instruct.sh">run_stage2b_instruct.sh</a>  # Stage 2b launcher — instruction tuning (EN)
 │   ├── <a href="scripts/run_stage2b_bilingual.sh">run_stage2b_bilingual.sh</a> # Stage 2b launcher — instruction tuning (EN+KO)
 │   ├── <a href="scripts/prepare_llava_jsonl.py">prepare_llava_jsonl.py</a>   # LLaVA JSON -> JSONL, drops missing-image records
+│   ├── <a href="scripts/run_stage2c_v2.sh">run_stage2c_v2.sh</a>        # Stage 2c launcher — OCR, calibration-corrected
+│   ├── <a href="scripts/train_dpo_vlm.py">train_dpo_vlm.py</a>         # Stage 3: DPO (precomputed reference policy)
+│   ├── <a href="scripts/prepare_dpo_data.py">prepare_dpo_data.py</a>      # RLHF-V preference pairs -> JSONL
+│   ├── <a href="scripts/prepare_ocr_data_v2.py">prepare_ocr_data_v2.py</a>   # OCR mix with stratified yes/no replay
+│   ├── <a href="scripts/build_bilingual_mix_v2.py">build_bilingual_mix_v2.py</a> # EN/KO mix + English short-answer VQA
+│   ├── <a href="scripts/vlm_studio.py">vlm_studio.py</a>            # Streamlit GUI — chat, compare, saliency, prompt lab
+│   ├── <a href="scripts/demo_video.py">demo_video.py</a>            # Video understanding probe (frame aggregation)
+│   ├── <a href="scripts/gpu_queue.sh">gpu_queue.sh</a>             # Sequential job queue so the GPU never idles
+│   ├── <a href="scripts/run_eval_2b.sh">run_eval_2b.sh</a>           # POPE + VQAv2 sighted/blind in one pass
+│   ├── <a href="scripts/publish_to_hf.py">publish_to_hf.py</a>         # Publish encoder + VLM to Hugging Face
 │   ├── <a href="scripts/demo_vlm.py">demo_vlm.py</a>              # VLM inference / interactive chat about an image
 │   └── <a href="scripts/eval_vlm.py">eval_vlm.py</a>              # VLM benchmarks: POPE / VQAv2 / MME / MMBench / held-out
 ├── <a href="configs/">configs/</a>
@@ -214,6 +295,9 @@ L_total = L_SigLIP + λ_hct·L_HCT + λ_sal·β_sal·L_saliency + L_distill
 
 ## Documentation
 
+- **Technical Documentation Report** — full architecture, methodology, mathematics and results for Stages 1–3 (distributed separately; `docs/reports/` is untracked)
+- [**VLM model card**](docs/HF_VLM_MODEL_CARD.md) — the bilingual vision-language model
+- [**Training guide**](docs/TRAINING_GUIDE.md) — how to reproduce each stage
 | Doc | Contents |
 |---|---|
 | [`PIPELINE_TECHNICAL_SPEC.md`](docs/PIPELINE_TECHNICAL_SPEC.md) | Complete module-by-module spec: shapes, equations, execution timeline |

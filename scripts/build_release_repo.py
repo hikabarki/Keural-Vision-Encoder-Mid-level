@@ -53,7 +53,7 @@ SCRIPTS = [
 
 DOCS = ["ARCHITECTURE.md", "PIPELINE_TECHNICAL_SPEC.md", "BENCHMARK_COMPARISON.md",
         "TRAINING_GUIDE.md", "DATASET_INFO.md", "DATASET_DOWNLOAD.md",
-        "KEURAL_TINY_VS_MID.md", "HF_MODEL_CARD.md", "HF_VLM_MODEL_CARD.md"]
+        "KEURAL_TINY_VS_MID.md", "HF_MODEL_CARD.md"]
 
 FIGURES = ["training_loss_curves.png", "benchmark_comparison_chart.png",
            "benchmark_radar_chart.png", "benchmark_recall_curve_chart.png",
@@ -96,6 +96,10 @@ for f in ROOT_FILES:
     if (SRC / f).exists():
         plan.append((SRC / f, DST / f, "file"))
 # The release README lives in the source repo so a rebuild cannot lose it.
+RELEASE_CARD = SRC / "docs/release/HF_VLM_MODEL_CARD.md"
+if RELEASE_CARD.exists():
+    plan.append((RELEASE_CARD, DST / "docs/HF_VLM_MODEL_CARD.md", "file"))
+
 RELEASE_README = SRC / "docs/release/README.md"
 if RELEASE_README.exists():
     plan.append((RELEASE_README, DST / "README.md", "file"))
@@ -116,9 +120,14 @@ if args.dry_run:
     print("\n--dry-run: nothing written.")
     sys.exit(0)
 
+# Rebuild the contents but PRESERVE .git — an rmtree of the destination takes
+# the repository history with it, which silently orphans the published remote.
 if DST.exists():
-    shutil.rmtree(DST)
-DST.mkdir(parents=True)
+    for child in DST.iterdir():
+        if child.name == ".git":
+            continue
+        shutil.rmtree(child) if child.is_dir() else child.unlink()
+DST.mkdir(parents=True, exist_ok=True)
 
 IGNORE = shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo", ".pytest_cache",
                                 "*.egg-info", ".ipynb_checkpoints")
@@ -145,6 +154,24 @@ print(f"  {n} files, {size:.1f} MB")
 leaked = []
 for pat in ("*dpo*", "*ocr*", "*2c*", "model_selection*", "gpu_queue*",
             "publish_to_hf*", "update_*report*", "*weekly*"):
-    leaked += [str(p.relative_to(DST)) for p in DST.rglob(pat) if p.is_file()]
+    leaked += [str(p.relative_to(DST)) for p in DST.rglob(pat)
+               if p.is_file() and ".git" not in p.parts]
+
+# Filenames are not enough: the excluded results can travel inside a document.
+# The 2c/DPO comparison table reached the release repo through the model card,
+# which no filename pattern would ever have caught.
+TERMS = ("2c v1", "2c v2", "Stage 3 — DPO", "Stage 2c", "DPO", "1337.8",
+         "137.5", "0.886", "0.116", "RLHF-V")
+for f in DST.rglob("*"):
+    if ".git" in f.parts:
+        continue
+    if f.is_file() and f.suffix in (".md", ".py", ".sh", ".json", ".yaml", ".yml"):
+        try:
+            body = f.read_text(errors="ignore")
+        except Exception:
+            continue
+        hits = [w for w in TERMS if w in body]
+        if hits:
+            leaked.append(f"{f.relative_to(DST)} contains {hits}")
 print(f"  excluded-content leak check: {len(leaked)} hits"
       + ("" if not leaked else f" -> {leaked}"))

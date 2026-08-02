@@ -66,7 +66,7 @@ model-index:
 ![Keural Mid architecture](keural_mid_architecture.png)
 
 <p>
-  <img alt="params" src="https://img.shields.io/badge/params-183.5M-blue"/>
+  <img alt="params" src="https://img.shields.io/badge/params-183.6M-blue"/>
   <img alt="from scratch" src="https://img.shields.io/badge/trained-from%20scratch-success"/>
   <img alt="precision" src="https://img.shields.io/badge/precision-bfloat16-informational"/>
   <img alt="status" src="https://img.shields.io/badge/status-training%20complete-success"/>
@@ -80,7 +80,7 @@ model-index:
 
 | | |
 |---|---|
-| **Parameters** | 183.5M |
+| **Parameters** | 183,575,297 (183.6M) |
 | **Input** | RGB image, 384×384 (any multiple of 16 supported natively) |
 | **Output** | 512 adaptive tokens (768-dim) + one pooled 768-dim image embedding |
 | **Trained** | From random init on ~20M image–text pairs, 18,000 steps, 2× H200 |
@@ -96,6 +96,41 @@ model-index:
 Measured at 384×384 with `token_budget=512`, matching training. Accuracy trails
 same-size peers — see [Limitations](#limitations) and [Evaluation](#evaluation)
 for why, and for the higher-k retrieval results where the gap closes.
+
+---
+
+## Downstream Results — Vision-Language Model
+
+The encoder is **frozen** and used as-is inside a bilingual (English + Korean)
+vision-language model: [`mkd-hika/keural-mid-vlm-bilingual`](https://huggingface.co/mkd-hika/keural-mid-vlm-bilingual).
+Only a projector (8.9M) and LoRA adapters (5.0M) are trained on top; the decoder is
+Qwen2.5-7B-Instruct.
+
+A vision-language model can score respectably while barely using the image, because
+many questions are answerable from language priors alone. Each benchmark below is
+therefore run **twice** — once normally, once with the visual tokens removed and
+everything else held constant. **The difference is what this encoder contributes**,
+and it is the only figure the language model cannot produce on its own.
+
+| Benchmark | With this encoder | Blind | **Encoder contributes** |
+|---|---|---|---|
+| POPE accuracy (n=2,000) | **70.50%** | 44.55% | **+25.95** |
+| POPE F1 (n=2,000) | **70.59%** | 23.46% | **+47.13** |
+| VQAv2 strict (n=5,000) | **53.04%** | 39.83% | **+13.21** |
+| MME total, 14 categories (n=2,374) | **1258.9** | 812.0 | **+446.9** |
+| MMBench (n=4,377) | 60.20% | — | — |
+| Held-out perplexity (KO / EN) | 2.15 / 2.99 | — | — |
+
+The POPE yes-ratio is **0.492 against a gold ratio of 0.500**, so the model genuinely
+discriminates on object-existence questions rather than defaulting to one answer —
+accuracy alone is not interpretable without that check. The blind VQAv2 score of
+39.83% lands where language-prior performance is expected to, which is corroborating
+evidence that the measurement is sound.
+
+Notably, the encoder reaches these numbers while scoring 37.2% zero-shot on ImageNet.
+Zero-shot accuracy measures image–text *alignment*; the 75.0% CIFAR-100 linear probe
+is the better indicator of representation quality for downstream use, because a
+trained projector relearns the alignment from scratch.
 
 ---
 
@@ -282,41 +317,6 @@ On **Text→Image R@5, Keural Mid (70.0%) outperforms CLIP ViT-B/16 trained on W
 The learned saliency map produces sharp, stable contours that track each image's dominant subject, visible from mid-training through the final checkpoint. Quantitatively, the continuous saliency map stabilizes fast (cosine similarity to the final checkpoint reaches ~0.83-0.90 within the first few thousand steps), but the *discrete* sampled token positions are considerably less stable — only ~50% overlap with the final checkpoint's tokens by step 13-14K, jumping to 73% at step 16K. Exact token placement was still moving late into training even where the saliency field itself looked converged.
 
 ---
-
----
-
-## Downstream Results — Vision-Language Model
-
-The encoder is **frozen** and used as-is inside a bilingual (English + Korean)
-vision-language model: [`mkd-hika/keural-mid-vlm-bilingual`](https://huggingface.co/mkd-hika/keural-mid-vlm-bilingual).
-Only a projector (8.9M) and LoRA adapters (5.0M) are trained on top; the decoder is
-Qwen2.5-7B-Instruct.
-
-A vision-language model can score respectably while barely using the image, because
-many questions are answerable from language priors alone. Each benchmark below is
-therefore run **twice** — once normally, once with the visual tokens removed and
-everything else held constant. **The difference is what this encoder contributes**,
-and it is the only figure the language model cannot produce on its own.
-
-| Benchmark | With this encoder | Blind | **Encoder contributes** |
-|---|---|---|---|
-| POPE accuracy (n=2,000) | **70.50%** | 44.55% | **+25.95** |
-| POPE F1 (n=2,000) | **70.59%** | 23.46% | **+47.13** |
-| VQAv2 strict (n=5,000) | **53.04%** | 39.83% | **+13.21** |
-| MME total, 14 categories (n=2,374) | **1258.9** | 812.0 | **+446.9** |
-| MMBench (n=4,377) | 60.20% | — | — |
-| Held-out perplexity (KO / EN) | 2.15 / 2.99 | — | — |
-
-The POPE yes-ratio is **0.492 against a gold ratio of 0.500**, so the model genuinely
-discriminates on object-existence questions rather than defaulting to one answer —
-accuracy alone is not interpretable without that check. The blind VQAv2 score of
-39.83% lands where language-prior performance is expected to, which is corroborating
-evidence that the measurement is sound.
-
-Notably, the encoder reaches these numbers while scoring 37.2% zero-shot on ImageNet.
-Zero-shot accuracy measures image–text *alignment*; the 75.0% CIFAR-100 linear probe
-is the better indicator of representation quality for downstream use, because a
-trained projector relearns the alignment from scratch.
 
 ---
 
